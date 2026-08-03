@@ -38,16 +38,43 @@ def main():
     snowflake = factory.create_snowflake()
     logger.info("组件实例化完成")
 
+    # 2.5 创建存储仓库（PostgresRepository）
+    from repositories import PostgresRepository
+    pg_cfg = config.storage.get("postgres", {})
+    pg_repo = PostgresRepository(
+        host=pg_cfg.get("host", "localhost"),
+        port=pg_cfg.get("port", 5432),
+        database=pg_cfg.get("database", "knowledge_base"),
+        user=pg_cfg.get("user", "admin"),
+        password=pg_cfg.get("password", "")
+    )
+    # 溯源服务注入 chunk 仓库
+    from services.trace_service import set_chunk_repository
+    set_chunk_repository(pg_repo)
+    logger.info("存储仓库已创建并注入溯源服务")
+
     # 3. 启动 PySide6 应用
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
 
-    # 4. 组装业务服务（TODO: 接入真实 pg_repo / minio_repo / chunker / classify）
-    #    骨架阶段先留空，待存储层实现后注入
+    # 4. 组装业务服务
     from services.rag_service import RagService
+    from services.classify_service import ClassifyService
+    from services.compensation import CompensationReconciler
+    import services.lifecycle_service as lifecycle
+    import services.file_service as file_svc
+
     rag_service = RagService(
         embedder=embedder, llm=llm, qdrant_store=qdrant,
         config=config.retrieval
+    )
+    classify_service = ClassifyService(
+        llm=llm, category_repo=pg_repo, snowflake=snowflake
+    )
+    # 补偿 reconciler（注入 pg_repo / qdrant / minio_repo）
+    # minio_repo 暂用占位（待 minio 仓库实现后替换）
+    reconciler = CompensationReconciler(
+        pg=pg_repo, qdrant=qdrant, minio=None
     )
 
     # 5. 启动主窗口
@@ -57,15 +84,22 @@ def main():
     logger.info("应用已启动")
 
     # 6. 启动补偿队列 reconciler（后台线程）
-    # TODO: 接入真实 pg_repo 后启用
-    # from services.compensation import CompensationReconciler
-    # reconciler = CompensationReconciler(pg_repo, qdrant, minio_repo)
-    # import threading
-    # t = threading.Thread(target=reconciler.run_forever, daemon=True)
-    # t.start()
+    import threading
+    t = threading.Thread(target=reconciler.run_forever, daemon=True)
+    t.start()
+    logger.info("补偿队列 reconciler 已启动")
 
-    # 7. 扫描 pending/failed 文档恢复执行
-    # TODO: file_service.resume_interrupted()
+    # 7. 扫描 pending/failed 文档恢复执行（后台异步）
+    # TODO: 待 chunker / minio_repo 实现后启用完整恢复流程
+    # def _resume():
+    #     file_service = file_svc.FileService(
+    #         pg=pg_repo, minio=minio_repo, parser=parser,
+    #         chunker=chunker, embedder=embedder, snowflake=snowflake,
+    #         qdrant_store=qdrant, classify_service=classify_service,
+    #         compensation=reconciler
+    #     )
+    #     file_service.resume_interrupted()
+    # threading.Thread(target=_resume, daemon=True).start()
 
     sys.exit(app.exec())
 

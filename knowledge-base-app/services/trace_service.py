@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 # 与 7.1 编码格式约定一致：匹配 【chunk_<snowflake_id>】
 _CITATION_RE = re.compile(r'【(chunk_\d+)】')
 
+# 模块级 chunk 仓库引用（由 main.py 启动时通过 set_chunk_repository 注入）
+_chunk_repo = None
+
+
+def set_chunk_repository(repo):
+    """注入 chunk 仓库实例（main.py 启动时调用）。
+
+    保持 trace_references / trace_references_fallback 的现有签名不变，
+    同时让 _query_chunk 能访问真实 DB。测试时仍可 patch _query_chunk。
+    """
+    global _chunk_repo
+    _chunk_repo = repo
+
 
 def trace_references(answer: str, retrieved_chunk_ids: set) -> list:
     """从 AI 输出中解析块 ID，映射回原始文件。
@@ -91,6 +104,12 @@ def trace_references_fallback(answer: str, retrieved_chunk_ids: set) -> list:
 
 
 def _query_chunk(chunk_id: int):
-    """查询 chunk_index 表（骨架：返回 None，集成时接入真实 DB）"""
-    # TODO: 接入真实 PG 查询
-    return None
+    """查询 chunk_index 表（通过注入的 chunk 仓库）。
+
+    仓库未注入时返回 None（骨架阶段/未配置 DB）；
+    仓库已注入时调用 get_chunk，异常向上传播由调用方捕获转 TraceError。
+    """
+    if _chunk_repo is None:
+        logger.debug("chunk 仓库未注入，_query_chunk 返回 None")
+        return None
+    return _chunk_repo.get_chunk(chunk_id)
