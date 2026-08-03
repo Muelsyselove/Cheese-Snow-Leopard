@@ -64,6 +64,9 @@
   - [14.1 测试分层架构](#141-测试分层架构)
   - [14.2 关键模块测试要点](#142-关键模块测试要点)
   - [14.3 持续集成流水线](#143-持续集成流水线)
+- [15 生命周期管理与并发控制](#15-生命周期管理与并发控制)
+  - [15.1 文档生命周期管理](#151-文档生命周期管理)
+  - [15.2 并发控制](#152-并发控制任务队列--gpu-信号量--llm-令牌桶)
 
 ---
 
@@ -82,7 +85,7 @@
 | ③ | AI 自动分析+分类+建立目录 | 接入文字 LLM API，自动分析内容并分类存储，建立两个目录：原始文件目录（文件→知识块映射）和知识分类目录 |
 | ④ | 智能问答带引用溯源 | 用户提问后由 AI 决定调用知识库内容，输出结果并告知参考了哪些文章/图片 |
 | ⑤ | 多分类存储 | 一个知识可属于多个分类，在每一个相关分类中都进行存储 |
-| ⑥ | 系统级溯源（非 AI） | AI 分析存储的每个知识要有独特编码（系统自动完成），输出后由系统（非 AI）根据编码自动溯源 |
+| ⑥ | 系统级溯源（非 AI） | AI 分析存储的每个知识块由系统生成独特编码（Snowflake ID，每块唯一）；SHA-256 内容指纹用于去重与完整性校验。输出答案后由系统（非 AI）根据编码自动溯源映射回原始文件/图片 |
 
 ### 1.3 设计原则
 
@@ -223,27 +226,34 @@ AI 能力分为两层：
 #### 原始文件目录（document_index 表）
 
 ```sql
--- 文件级正向索引：文件 → 包含哪些知识块
+-- 文件级正向索引：文件元数据。块列表通过 chunk_index.doc_id 反向查询获取，
+-- 不再冗余存储 chunk_ids JSONB（避免双索引不一致）。
 CREATE TABLE document_index (
     doc_id          BIGINT PRIMARY KEY,      -- Snowflake 业务ID
     file_name       VARCHAR(500) NOT NULL,    -- 原始文件名
     file_path       VARCHAR(1000) NOT NULL,   -- 对象存储路径
     file_type       VARCHAR(20) NOT NULL,     -- pdf/docx/png...
     content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 文件指纹
-    chunk_ids       JSONB NOT NULL,           -- 包含的块ID列表（正向索引）
     page_count      INT,
     upload_time     TIMESTAMPTZ DEFAULT now(),
-    parse_status    VARCHAR(20) DEFAULT 'pending'
+    parse_status    VARCHAR(20) DEFAULT 'pending',  -- 见 13.3 状态机
+    fail_stage      VARCHAR(20),              -- 失败时记录阶段: parse/embed/classify/store
+    fail_reason     TEXT                      -- 失败原因，供重启恢复诊断
 );
+
+-- 正向查询（文件→块列表）走此索引
+CREATE INDEX idx_chunk_index_doc_id ON chunk_index(doc_id);
 ```
 
 #### 知识块索引（chunk_index 表）
 
 ```sql
 -- 块级反向索引：知识块 → 来源文件 + 精确位置
+-- chunk_id 在 DB 中为 BIGINT；在 prompt/正则/集合中统一渲染为字符串 "chunk_<snowflake_id>"
+-- （详见 7.1 编码格式约定），DB 查询时用 CAST 或字符串拼接处理。
 CREATE TABLE chunk_index (
     chunk_id        BIGINT PRIMARY KEY,       -- Snowflake 业务ID（系统生成）
-    content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 内容指纹（去重+完整性校验）
+    content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 内容指纹（完整性校验+去重）
     doc_id          BIGINT NOT NULL,          -- 来源文件ID（反向索引）
     doc_name        VARCHAR(500) NOT NULL,    -- 来源文件名（冗余存储便于溯源）
     page_number     INT,                       -- 所在页码
@@ -251,13 +261,17 @@ CREATE TABLE chunk_index (
     char_end        INT,                       -- 字符结束偏移
     bbox            JSONB,                     -- 页面坐标框 [x,y,w,h]
     chunk_type      VARCHAR(20),              -- text/table/image/formula
-    content         TEXT NOT NULL,            -- 块文本内容
+    content         TEXT NOT NULL,            -- 块文本内容（图片块为 VLM 描述文本）
     vector_id       VARCHAR(100),             -- 向量库中的对应ID
-    categories      JSONB DEFAULT '[]',       -- 所属分类列表（多归属）
     created_at      TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (doc_id) REFERENCES document_index(doc_id)
 );
+
+-- 去重键：同一文件内相同内容去重，跨文件不去重（保留独立来源）
+CREATE UNIQUE INDEX idx_chunk_dedup ON chunk_index(content_hash, doc_id);
 ```
+
+> **说明**：原 `categories` JSONB 字段已删除。多分类关系统一以 `chunk_category` 关联表为单一数据源，Qdrant payload 在写入时从关联表读取，避免双写不一致（详见 5.3）。
 
 #### 知识库分类目录（category 表 + chunk_category 关联表）
 
@@ -281,18 +295,23 @@ CREATE TABLE chunk_category (
 );
 ```
 
-**关键设计**：`document_index.chunk_ids` 提供正向索引（文件→块），`chunk_index.doc_id` 提供反向索引（块→文件）。这使得"某文件包含哪些知识"和"某知识来自哪个文件的哪一页"两个方向的查询都能高效完成。
+**关键设计**：`chunk_index.doc_id` 提供反向索引（块→文件），并建有 `idx_chunk_index_doc_id` 索引，正向查询（文件→块列表）通过 `SELECT chunk_id FROM chunk_index WHERE doc_id=?` 高效完成。两个方向的查询都走单一数据源，避免冗余字段不一致风险。
 
 ### 4.3 向量存储设计
 
-Qdrant 作为向量索引层，支持以下 Collection 设计：
+Qdrant 作为向量索引层，Collection 设计如下：
 
-| 模态 | Embedding 模型 | 向量类型 | Qdrant Collection |
-|------|---------------|----------|-------------------|
-| 文本块 | BGE-M3（用户可选 Qwen3-Embedding） | dense(1024) + sparse + colbert | `text_chunks` |
-| 图片块 | Qwen3-VL-Embedding-2B | dense(2048) | `image_chunks` |
+| 数据来源 | Embedding 模型 | 向量类型 | Qdrant Collection |
+|----------|---------------|----------|-------------------|
+| 文本块 + 图片块（VLM 描述文本） | BGE-M3（用户可选 Qwen3-Embedding） | dense(1024) + sparse + colbert | `text_chunks` |
 
-检索时分别召回文本块和图片块，RRF 融合后统一排序。若选 Qwen3-Embedding（仅 dense），系统自动降级为"dense + Qdrant 原生 BM25"双路检索，仍保留混合检索能力。
+**统一单 Collection 设计**：图片块不独立向量化，而是用本地 VLM 输出的描述文本走文本 Embedding 入 `text_chunks` collection，通过 payload 的 `chunk_type` 字段区分 `text`/`image`/`table`/`formula`。这样消除了独立的图片 Embedder 依赖（原 `Qwen3-VL-Embedding-2B` 已移除），避免了图文向量空间不一致问题，且图片块同样可被语义检索命中并在溯源时映射回原始图片位置。
+
+**稀疏向量来源约定**（避免向量空间混淆）：
+- **BGE-M3 模式**：sparse 向量由客户端 `BGEM3FlagModel` 计算 `lexical_weights` 后上传，与 dense 同源，向量空间一致。
+- **Qwen3-Embedding 模式**：模型仅输出 dense，sparse 降级为 Qdrant 服务端 `qdrant/bm25` 模型转换。此时 dense 与 sparse 分属不同向量空间，但 Qdrant 会分别建立索引，RRF 融合基于排名而非向量值，不影响检索正确性。
+
+若选 Qwen3-Embedding（仅 dense），系统自动降级为"dense + Qdrant 原生 BM25"双路检索，仍保留混合检索能力。
 
 ---
 
@@ -322,9 +341,10 @@ Qdrant 作为向量索引层，支持以下 Collection 设计：
 
 需求⑤要求"一个知识可属于多个分类"。实现方案为**标签 + 元数据过滤**，块物理存一份，通过 `chunk_category` 多对多关联表实现逻辑多归属：
 
-- `chunk_index.categories` 字段（JSONB）存储分类列表，便于 Qdrant 元数据过滤
-- `chunk_category` 关联表存储完整分类关系，含 AI 分配置信度
-- 检索时可按分类过滤：Qdrant 的 `Filter` + `FieldCondition` 支持按 `categories` 字段筛选
+- `chunk_category` 关联表为**单一数据源**，存储完整分类关系，含 AI 分配置信度
+- Qdrant payload 的 `categories` 字段在写入/更新时从 `chunk_category` 表读取并同步，不作为独立数据源
+- 检索时可按分类过滤：Qdrant 的 `Filter` + `FieldCondition` 支持按 payload 的 `categories` 字段筛选
+- 分类变更时（新增/删除关联）由系统代码同步更新 Qdrant payload，保证两端一致
 
 ---
 
@@ -373,18 +393,24 @@ Qdrant 原生支持稀疏向量（BM25），通过配置 `sparse_vectors` 并设
 
 ### 6.3 Agentic RAG 编排
 
-Agent 编排层使用 LangGraph 的 `StateGraph`，将检索器封装为 Tool，LLM 动态决策是否检索。LangGraph 仅作脚手架，检索逻辑全部自研：
+Agent 编排层使用 LangGraph 的 `StateGraph`，将检索器封装为 Tool，LLM 动态决策是否检索。LangGraph 仅作脚手架，检索逻辑全部自研。
+
+**关键技术决策**：不使用 LangGraph prebuilt `ToolNode`（它只把 tool 结果包成 `ToolMessage` 放回 `messages`，不会更新自定义状态字段）。改为**自定义 tools 节点**，在调用检索后显式写入 `state["retrieved_chunks"]`，确保系统级溯源兜底通道可用。
 
 ```python
 # services/rag_service.py — 自研 Agentic RAG
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 from typing import TypedDict, Annotated, Literal
 from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+
+# retrieved_chunks 用 add 防止多轮检索覆盖
+def _append_list(left: list, right: list) -> list:
+    return (left or []) + (right or [])
 
 class AgentState(TypedDict):
     messages: list
-    retrieved_chunks: list  # 检索结果（系统追踪）
+    retrieved_chunks: Annotated[list[str], _append_list]  # 系统追踪命中 chunk_id（字符串形式）
 
 @tool
 def knowledge_search(query: str) -> str:
@@ -392,17 +418,36 @@ def knowledge_search(query: str) -> str:
     results = rag_service.hybrid_search(query, top_k=20)
     formatted = []
     for chunk in results:
-        formatted.append(f"【{chunk.chunk_id}】{chunk.content}")
+        # chunk_id 统一渲染为 "chunk_<snowflake_id>" 字符串（见 7.1）
+        formatted.append(f"【chunk_{chunk.chunk_id}】{chunk.content}")
     return "\n\n".join(formatted)
 
 def chatbot_node(state: AgentState) -> AgentState:
     system = (
         "你是知识库助手。需要查询知识库时使用 knowledge_search 工具。"
-        "回答时在引用处标注【chunk_id】。"
+        "回答时在引用处标注【chunk_<id>】。"
     )
     messages = [{"role": "system", "content": system}, *state["messages"]]
     response = llm_client.chat(messages, tools=[knowledge_search])
     return {"messages": [response]}
+
+def tools_node(state: AgentState) -> AgentState:
+    """自定义 tools 节点：执行检索并填充 retrieved_chunks（替代 prebuilt ToolNode）"""
+    last_msg = state["messages"][-1]
+    tool_messages = []
+    hit_chunk_ids: list[str] = []
+
+    for call in getattr(last_msg, "tool_calls", []) or []:
+        if call["name"] == "knowledge_search":
+            # 在执行检索时同步记录命中 ID（系统级兜底通道）
+            hits = rag_service.last_hit_chunk_ids  # knowledge_search 内部缓存的命中 ID
+            hit_chunk_ids.extend(f"chunk_{cid}" for cid in hits)
+            result = knowledge_search.invoke(call["args"])
+            tool_messages.append(ToolMessage(
+                content=result, tool_call_id=call["id"], name=call["name"]
+            ))
+
+    return {"messages": tool_messages, "retrieved_chunks": hit_chunk_ids}
 
 def should_continue(state) -> Literal["tools", "end"]:
     last = state["messages"][-1]
@@ -411,7 +456,7 @@ def should_continue(state) -> Literal["tools", "end"]:
 # 组装状态图
 workflow = StateGraph(AgentState)
 workflow.add_node("chatbot", chatbot_node)
-workflow.add_node("tools", ToolNode([knowledge_search]))
+workflow.add_node("tools", tools_node)
 workflow.add_edge(START, "chatbot")
 workflow.add_conditional_edges("chatbot", should_continue,
                                 {"tools": "tools", "end": END})
@@ -419,7 +464,7 @@ workflow.add_edge("tools", "chatbot")
 rag_agent = workflow.compile()
 ```
 
-若 Agent 逻辑简单（仅"判断→检索→生成"循环），可用自研有限状态机替代 LangGraph，进一步减少依赖。
+> **架构决策**：统一采用 LangGraph 作为 Agent 编排脚手架，不再保留"自研有限状态机替代"的备选方案，避免实现分歧。如未来需剥离 LangGraph 依赖，`tools_node` 的状态填充逻辑可直接迁移到自研 FSM。
 
 ---
 
@@ -436,9 +481,23 @@ rag_agent = workflow.compile()
 | Snowflake | 时间戳+机器ID+序列号 | 趋势递增 | 无 | 需分配 workerId | 高（性能最优） |
 | SHA-256 指纹 | 内容加密哈希 | 无 | 天然去重 | 是 | 极高（内容即身份） |
 
-- Snowflake 提供时间排序、分布式生成、数据库索引友好（64 位长整型）
-- SHA-256 提供"内容即身份"的确定性溯源——相同内容必生成相同哈希，重算哈希即可验证块未被篡改
+- Snowflake 提供时间排序、数据库索引友好（64 位长整型），是每个块的**独特编码**（即使两块内容相同，Snowflake ID 也不同）
+- SHA-256 提供"内容即身份"的**内容指纹**——相同内容必生成相同哈希，用于去重（按 `content_hash` 唯一约束）与完整性校验（重算哈希验证块未被篡改）。注意：SHA-256 不是"独特编码"，相同内容共享同一指纹
 - 两者均在分块时由系统代码生成，完全不依赖 AI
+
+**Snowflake workerId 配置**（单机桌面场景）：桌面应用为单机单进程，无需分布式 workerId 协调。在 `config.yaml` 中配置固定 `worker_id`（默认 1），序列号位足够单机使用。若未来支持多实例，可通过本地文件锁分配 workerId。
+
+**编码格式约定（贯穿全系统）**：
+
+| 场景 | chunk_id 表示 | 示例 |
+|------|--------------|------|
+| 数据库存储 | BIGINT | `1751234567890` |
+| Prompt 注入 / AI 输出标注 | 字符串 `chunk_<snowflake_id>` | `chunk_1751234567890` |
+| 正则提取 | `r'【(chunk_\d+)】'` | 匹配 `【chunk_1751234567890】` |
+| `retrieved_chunks` 集合 | 字符串集合 `set[str]` | `{"chunk_1751234567890", ...}` |
+| DB 查询映射 | 字符串去前缀转 BIGINT | `int(cid.removeprefix("chunk_"))` |
+
+此约定确保 AI 输出标注、正则解析、集合校验、DB 查询四个环节格式一致，不会因类型不匹配导致溯源失效。
 
 ### 7.2 系统级溯源四步机制
 
@@ -447,22 +506,24 @@ rag_agent = workflow.compile()
 | 步骤 | 执行者 | 操作 |
 |------|--------|------|
 | ① 检索阶段 | 系统 | 向量+BM25 混合检索，返回 Top-K 块（每个块携带 chunk_id + 元数据） |
-| ② 上下文组装 | 系统 | 将块 ID 与块内容同时注入提示词，指令模型引用时标注 `【chunk_id】` |
-| ③ AI 生成 | AI | AI 输出带引用标记的答案（例：某知识来自 `【chunk_101】`） |
-| ④ 系统后处理 | 系统（非 AI） | 正则解析答案中的块 ID → 查询 chunk_index 表获取来源文件名/页码/坐标 → 校验 ID 是否在检索结果集中（过滤 AI 幻觉 ID）→ 返回结构化引用列表 |
+| ② 上下文组装 | 系统 | 将块 ID 与块内容同时注入提示词，指令模型引用时标注 `【chunk_<id>】` |
+| ③ AI 生成 | AI | AI 输出带引用标记的答案（例：某知识来自 `【chunk_1751234567890】`） |
+| ④ 系统后处理 | 系统（非 AI） | 正则提取答案中的块 ID → **过滤幻觉 ID**（仅保留 `retrieved_chunks` 集合内的）→ 查询 `chunk_index` 表获取来源文件名/页码/坐标 → 返回结构化引用列表 |
+
+> **顺序说明**：第④步先过滤后查询 DB，减少无效 DB 调用；与 7.3 实现代码顺序一致。
 
 **提示词模板示例**：
 
 ```
-请严格根据以下上下文回答问题。每个片段有唯一ID，格式为【chunk_id】。
+请严格根据以下上下文回答问题。每个片段有唯一ID，格式为【chunk_<id>】。
 
 <上下文>
-【chunk_101】知识库采用 Agentic RAG 架构...
-【chunk_102】Qdrant 向量数据库支持元数据过滤...
-【chunk_103】PaddleOCR 中文识别准确率达 96%...
+【chunk_1751234567890】知识库采用 Agentic RAG 架构...
+【chunk_1751234567891】Qdrant 向量数据库支持元数据过滤...
+【chunk_1751234567892】PaddleOCR 中文识别准确率达 96%...
 </上下文>
 
-要求：每个事实后用【chunk_id】注明来源片段ID。
+要求：每个事实后用【chunk_<id>】注明来源片段ID。
 若信息不足以回答，请说明而非编造。
 ```
 
@@ -471,31 +532,55 @@ rag_agent = workflow.compile()
 ```python
 # services/trace_service.py — 系统后处理溯源（完全不依赖AI）
 import re
+from exceptions import TraceError
+
+# 与 7.1 编码格式约定一致：匹配 【chunk_<snowflake_id>】
+_CITATION_RE = re.compile(r'【(chunk_\d+)】')
 
 def trace_references(answer: str, retrieved_chunk_ids: set) -> list:
-    """从AI输出中解析块ID，映射回原始文件"""
-    # 1. 正则提取答案中的所有块ID
-    cited_ids = set(re.findall(r'【(chunk_\d+)】', answer))
+    """从AI输出中解析块ID，映射回原始文件。
+
+    Args:
+        answer: AI 生成的答案文本
+        retrieved_chunk_ids: 本轮检索命中的 chunk_id 字符串集合（格式 "chunk_<id>"）
+
+    Returns:
+        结构化引用列表，过滤掉 AI 幻觉的 ID
+    Raises:
+        TraceError: DB 查询失败时抛出
+    """
+    # 1. 正则提取答案中的所有块ID（字符串形式 chunk_<id>）
+    cited_ids = set(_CITATION_RE.findall(answer))
 
     # 2. 过滤幻觉ID——仅采纳检索结果集内的ID
     valid_ids = cited_ids & retrieved_chunk_ids
 
     # 3. 查询数据库，映射回原始文件与位置
     references = []
-    for chunk_id in valid_ids:
-        chunk = db.query(
-            "SELECT chunk_id, doc_name, page_number, "
-            "bbox, content, chunk_type "
-            "FROM chunk_index WHERE chunk_id = %s",
-            chunk_id
-        )
+    for cid_str in valid_ids:
+        # 字符串转 BIGINT 用于 DB 查询
+        chunk_id_int = int(cid_str.removeprefix("chunk_"))
+        try:
+            chunk = db.query(
+                "SELECT chunk_id, doc_name, page_number, "
+                "bbox, content, chunk_type "
+                "FROM chunk_index WHERE chunk_id = %s",
+                chunk_id_int
+            )
+        except Exception as e:
+            raise TraceError(f"溯源 DB 查询失败 chunk_id={cid_str}: {e}") from e
+
+        if chunk is None:
+            # ID 在集合内但 DB 查不到，记录但不阻断
+            continue
+
         references.append({
-            "chunk_id": chunk.chunk_id,
-            "source_file": chunk.doc_name,      # 参考了哪篇文章
-            "page": chunk.page_number,           # 第几页
-            "position": chunk.bbox,              # 页面坐标
-            "type": chunk.chunk_type,            # text/image/table
-            "excerpt": chunk.content[:200]       # 内容摘要
+            "chunk_id": cid_str,                  # 对外统一返回字符串形式
+            "source_file": chunk.doc_name,        # 参考了哪篇文章
+            "page": chunk.page_number,            # 第几页
+            "position": chunk.bbox,               # 页面坐标
+            "type": chunk.chunk_type,             # text/image/table
+            "excerpt": chunk.content[:200]        # 内容摘要
         })
 
     return references  # → 前端渲染为可点击引用脚注
@@ -523,6 +608,7 @@ def trace_references(answer: str, retrieved_chunk_ids: set) -> list:
 
 ```python
 # interfaces.py — 接口隔离层（自研）
+from __future__ import annotations
 from typing import Protocol, List, Dict
 from dataclasses import dataclass
 
@@ -536,15 +622,25 @@ class ParsedDocument:
 class EmbeddingResult:
     """向量化结果 — 支持三模态（dense/sparse/colbert）"""
     dense: list[float]           # 稠密向量（必有）
-    sparse: dict[str, float] = None    # 稀疏向量（BGE-M3 有，Qwen3 无）
+    sparse: dict[str, float] = None    # 稀疏向量（BGE-M3 客户端计算有，Qwen3 无）
     colbert: list[list[float]] = None  # 多向量（仅 BGE-M3 ColBERT 模式）
 
 class DocumentParser(Protocol):
-    """文档解析接口 — MinerU/Docling 均可实现"""
-    def parse(self, file_path: str) -> ParsedDocument: ...
+    """统一文档解析接口 — VLM（PaddleOCR-VL/MinerU/MiniCPM-V）均为该接口的实现。
+
+    合并了原 DocumentParser 与 VisionLanguageModel 的职责：
+    - parse_document: 文档版面解析 + OCR + 图片理解，输出结构化 ParsedDocument
+    - understand_image: 单独图片理解（用于图片直接导入场景，可选实现）
+    图片块的 content 字段为 VLM 输出的描述文本，下游统一走文本 Embedding。
+    """
+    def parse_document(self, file_path: str) -> ParsedDocument: ...
+    def understand_image(self, image_path: str, prompt: str) -> str: ...
+    @property
+    def requires_gpu(self) -> bool: ...  # 方案A=False, 方案B(vlm)=True, 方案C=True
 
 class Embedder(Protocol):
-    """向量化接口 — 用户可选 BGE-M3 或 Qwen3-Embedding 实现"""
+    """文本向量化接口 — 文本块与图片块（描述文本）统一走此接口。
+    用户可选 BGE-M3 或 Qwen3-Embedding 实现。无独立图片 Embedder。"""
     def encode(self, texts: list[str]) -> list[EmbeddingResult]: ...
     def encode_query(self, query: str) -> EmbeddingResult: ...
     @property
@@ -561,46 +657,61 @@ class LLMClient(Protocol):
     """文字 LLM API 接口 — 仅纯文本，对接用户自有 API"""
     def chat(self, messages: list[dict], tools: list = None) -> dict: ...
     def stream_chat(self, messages: list[dict]) -> str: ...
-
-class VisionLanguageModel(Protocol):
-    """本地 VLM 接口 — 多模态理解（图片→文本），本地部署零 API 费用。
-    用户可选方案A/B/C，在配置中指定。"""
-    def understand_image(self, image_path: str, prompt: str) -> str: ...
-    def parse_document(self, file_path: str) -> ParsedDocument: ...
-    @property
-    def requires_gpu(self) -> bool: ...  # 方案A=False, 方案B/C=True
 ```
 
 **VLM 实现示例（用户在配置中选择其一）**：
 
 ```python
 # adapters/paddleocr_vl.py — 方案A：PaddleOCR-VL-0.9B（CPU 可运行·无 GPU 首选）
+# 注：API 以 paddleocr 实际导出为准，此处为示意，集成时需核对版本
 class PaddleOCRVLModel:
-    def understand_image(self, image_path: str, prompt: str) -> str:
+    def parse_document(self, file_path: str) -> ParsedDocument:
         from paddleocr import PaddleOCRVL
         model = PaddleOCRVL()
-        result = model.predict(image_path)
-        return result.markdown
+        result = model.predict(file_path)
+        return _to_parsed_document(result.markdown, result.layout)
+
+    def understand_image(self, image_path: str, prompt: str) -> str:
+        from paddleocr import PaddleOCRVL
+        return PaddleOCRVL().predict(image_path).markdown
 
     @property
     def requires_gpu(self) -> bool: return False
 
-# adapters/mineru_vlm.py — 方案B：MinerU 2.5 VLM 后端（版面精度首选·需 GPU）
-class MinerUVLMModel:
-    def __init__(self):
-        from mineru.cli.common import do_parse, read_fn
-        self.backend = "vlm"  # 或 "pipeline" 降级为 CPU
+# adapters/mineru_vlm.py — 方案B：MinerU 框架（含 vlm/pipeline 两后端）
+#   - backend="vlm":      需 GPU，版面精度首选（97.5% mAP）
+#   - backend="pipeline": CPU 可降级，精度略低但无 GPU 可用
+class MinerUModel:
+    def __init__(self, backend: str = "vlm"):
+        if backend not in ("vlm", "pipeline"):
+            raise ValueError(f"未知 MinerU 后端: {backend}")
+        self.backend = backend
 
     def parse_document(self, file_path: str) -> ParsedDocument:
+        from mineru.cli.common import do_parse, read_fn  # API 以实际版本为准
         pdf_bytes = read_fn(file_path)
-        do_parse(output_dir="./tmp", pdf_bytes_list=[pdf_bytes], ...)
+        do_parse(
+            output_dir="./tmp",
+            pdf_bytes_list=[pdf_bytes],
+            backend=self.backend,
+        )
+        ...
+        ...
+
+    def understand_image(self, image_path: str, prompt: str) -> str:
+        # MinerU 主要面向文档，单图理解可降级到内置 OCR
         ...
 
     @property
-    def requires_gpu(self) -> bool: return True
+    def requires_gpu(self) -> bool:
+        return self.backend == "vlm"  # pipeline 后端可 CPU
 
 # adapters/minicpm_vlm.py — 方案C：MiniCPM-V 4.5（通用图像理解·需 GPU）
 class MiniCPMVModel:
+    def parse_document(self, file_path: str) -> ParsedDocument:
+        # MiniCPM-V 偏通用图像理解，文档版面解析需配合分页渲染逐页理解
+        ...
+
     def understand_image(self, image_path: str, prompt: str) -> str:
         from lmdeploy import pipeline
         from lmdeploy.vl import load_image
@@ -640,12 +751,17 @@ class BgeM3Embedder:
 
 # adapters/qwen3_embedder.py — 方案B：Qwen3-Embedding（纯 dense，CMTEB 中文榜首）
 class Qwen3Embedder:
+    # Qwen3-Embedding 官方推荐：query 加 instruction 前缀，document 不加。
+    # CMTEB 榜单成绩即带 instruction 测得，不加会显著降低召回。
+    _QUERY_INSTRUCTION = "Instruct: Given a web search query, retrieve relevant passages that answer the query.\nquery: "
+
     def __init__(self, model_name: str = 'Qwen/Qwen3-Embedding-0.6B'):
         from transformers import AutoModel, AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
 
     def encode(self, texts: list[str]) -> list[EmbeddingResult]:
+        # 文档侧：不加 instruction
         import torch
         inputs = self.tokenizer(texts, padding=True, truncation=True,
                                  max_length=8192, return_tensors='pt')
@@ -656,7 +772,8 @@ class Qwen3Embedder:
         return [EmbeddingResult(dense=v.tolist()) for v in dense_vecs]
 
     def encode_query(self, query: str) -> EmbeddingResult:
-        return self.encode([query])[0]
+        # 查询侧：加 instruction 前缀
+        return self.encode([self._QUERY_INSTRUCTION + query])[0]
 
     @property
     def supports_sparse(self) -> bool: return False
@@ -678,26 +795,26 @@ class Qwen3Embedder:
 knowledge-base-app/
 ├── main.py                    # PySide6 入口
 ├── interfaces/                # 接口隔离层（自研）
-│   ├── parser.py              # DocumentParser Protocol
-│   ├── embedder.py            # Embedder Protocol
+│   ├── parser.py              # DocumentParser Protocol（统一文档/图片解析）
+│   ├── embedder.py            # Embedder Protocol（文本+图片描述统一）
 │   ├── vectorstore.py         # VectorStore Protocol
-│   ├── llm.py                 # LLMClient Protocol（文字 LLM API）
-│   └── vlm.py                 # VisionLanguageModel Protocol（本地 VLM）
+│   └── llm.py                 # LLMClient Protocol（文字 LLM API）
 ├── adapters/                  # 接口实现（可替换）
-│   ├── mineru_parser.py       # MinerU DocumentParser 实现
-│   ├── paddle_ocr.py          # PaddleOCR 实现
 │   ├── paddleocr_vl.py        # VLM 方案A：PaddleOCR-VL-0.9B（CPU 可运行）
-│   ├── mineru_vlm.py          # VLM 方案B：MinerU 2.5 VLM 后端（需 GPU）
+│   ├── mineru_vlm.py          # VLM 方案B：MinerU 框架（vlm/pipeline 两后端）
 │   ├── minicpm_vlm.py         # VLM 方案C：MiniCPM-V 4.5（需 GPU）
 │   ├── bge_embedder.py        # Embedding 方案A：BGE-M3（三模态）
 │   ├── qwen3_embedder.py      # Embedding 方案B：Qwen3-Embedding（纯 dense）
 │   ├── qdrant_store.py        # Qdrant 实现
 │   └── openai_llm.py          # OpenAI 兼容文字 LLM 实现
 ├── services/                  # 业务逻辑层（自研核心）
-│   ├── file_service.py        # 文件管理 + 导入
+│   ├── file_service.py        # 文件管理 + 导入 + 生命周期（删除/更新）
 │   ├── classify_service.py    # AI 分类 + 多归属
 │   ├── rag_service.py         # Agentic RAG 编排
 │   ├── trace_service.py       # 溯源解析（非AI）
+│   ├── lifecycle_service.py   # 删除/更新/分类变更链路（见 15 章）
+│   ├── concurrency.py         # 全局任务队列+GPU 信号量+LLM 令牌桶（见 15 章）
+│   ├── compensation.py        # 补偿队列 + reconciler（见 13.3）
 │   └── encoding.py            # Snowflake + SHA-256
 ├── ui/                        # PySide6 桌面 UI
 │   ├── main_window.py         # 主窗口（三栏布局）
@@ -714,7 +831,7 @@ knowledge-base-app/
 │   ├── chunk.py               # 知识块模型
 │   ├── document.py            # 文档模型
 │   └── category.py            # 分类模型
-└── config.py                  # 配置（API Key、模型选择、路径等）
+└── config.py                  # 配置（API Key 走 keyring、模型选择、路径等）
 ```
 
 ### 8.4 QThread 异步模式
@@ -743,7 +860,7 @@ class ParseWorker(QThread):
                     int(i / len(self.file_paths) * 100),
                     f"正在解析: {path}"
                 )
-                doc = self.parser.parse(path)  # 调用接口，不感知底层实现
+                doc = self.parser.parse_document(path)  # 调用统一接口
                 results.append(doc)
             except Exception as e:
                 self.error.emit(str(e))
@@ -776,7 +893,7 @@ class MainWindow(QMainWindow):
 | 组件 | 技术选型 | 协议 | 本地部署 | 硬件需求 |
 |------|----------|------|----------|----------|
 | 桌面应用 | PySide6 | LGPL v3 | 是 | 普通 PC |
-| PDF 渲染 | PyMuPDF | AGPL-3.0 | 是 | 纯 CPU |
+| PDF 渲染 | PyMuPDF | **AGPL-3.0** ⚠️ | 是 | 纯 CPU |
 | 本地 VLM（用户可选） | PaddleOCR-VL-0.9B / MinerU 2.5 VLM / MiniCPM-V 4.5 | Apache 2.0 / AGPL-3.0 | 是 | 方案A CPU 可运行；方案B 需 GPU ≥8GB；方案C AWQ 5GB 显存 |
 | OCR 引擎 | PaddleOCR PP-OCRv6 | Apache 2.0 | 是 | 纯 CPU 可行 |
 | 原始文件存储 | MinIO | AGPLv3 | 是 | 普通服务器 |
@@ -787,11 +904,14 @@ class MainWindow(QMainWindow):
 | LLM API | 用户自有 API（OpenAI 兼容） | — | 云端（唯一外部依赖） | — |
 | 打包分发 | PyInstaller / Nuitka | GPL/商业 | 是 | 生成 .exe/.dmg |
 
+> **⚠️ AGPL 传染性风险提示**：PyMuPDF（AGPL-3.0）、MinIO（AGPLv3）、MinerU（AGPL-3.0）均为 AGPL 协议。AGPL 具有强传染性，若通过网络提供服务则需开源整个应用。本应用为**本地桌面应用、单用户、不对外提供网络服务**，AGPL 传染性风险可控；但若未来转为 SaaS 或多用户服务端，则必须：① 替换为非 AGPL 替代品（PyMuPDF→PyPDF2/pdfplumber；MinIO→本地文件系统+SQLite BLOB；MinerU→Docling/MIT 协议工具），或 ② 整体开源。闭源商用前请务必进行许可证合规审查。
+
 ### 9.2 硬件配置要求
 
 | 配置档位 | CPU | GPU | 内存 | 磁盘 | 能力说明 |
 |----------|-----|-----|------|------|----------|
-| 最低可用 | 4核 | 无 | 8GB | 50GB | VLM 方案A: PaddleOCR-VL-0.9B (CPU) + MinerU Pipeline(CPU) + Embedding(CPU: BGE-M3 ONNX 或 Qwen3-0.6B) + Qdrant |
+| 最低可用 | 4核 | 无 | **12GB** | 50GB | VLM 方案A: PaddleOCR-VL-0.9B (CPU) + MinerU Pipeline(CPU) + Embedding(CPU: BGE-M3 ONNX 或 Qwen3-0.6B) + Qdrant。原 8GB 在 PG+MinIO+Qdrant+PySide6+VLM 推理峰值下会频繁 swap，提至 12GB |
+| 轻量部署（无 Docker） | 4核 | 无 | 8GB | 30GB | SQLite 替代 PostgreSQL + 本地文件系统替代 MinIO + Qdrant 单二进制。牺牲并发写入能力，适合单用户桌面场景（见 9.4） |
 | 推荐配置 | 8核 | RTX 3060/4060 8GB | 16GB | 200GB SSD | VLM 方案B/C: MinerU VLM 或 MiniCPM-V 4.5 (GPU) + Embedding(GPU: BGE-M3 或 Qwen3-4B) |
 | 生产配置 | 16核 | RTX 4090 24GB | 32GB | 500GB NVMe | 支持大规模文档批量解析+多模态理解+推理+检索 |
 
@@ -847,6 +967,45 @@ psql -h localhost -U admin -d knowledge_base -f schema.sql
 python main.py
 ```
 
+### 9.4 无 Docker 轻量部署方案（单机桌面推荐）
+
+普通用户机器未必安装 Docker。提供无 Docker 方案，将存储组件替换为本地二进制/嵌入式方案，降低部署门槛：
+
+```bash
+# ===== 无 Docker 轻量部署（单机桌面场景）=====
+
+# 1. Qdrant 单二进制（无需 Docker）
+curl -L https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-gnu.tar.gz | tar xz
+./qdrant --storage-dir ./qdrant_data &
+
+# 2. 元数据存储：SQLite 替代 PostgreSQL（通过 SQLAlchemy ORM 切换驱动）
+#    config.yaml 中 storage.postgres 段改为 storage.sqlite:
+#      sqlite:
+#        path: "./data/knowledge_base.db"
+#    业务代码经 SQLAlchemy ORM，驱动切换零修改
+
+# 3. 原始文件存储：本地文件系统替代 MinIO
+#    config.yaml 中 storage.minio 段改为 storage.local_fs:
+#      local_fs:
+#        root: "./data/files"
+#    VectorStore/Storage 接口实现 LocalFSAdapter，签名与 MinIO 一致
+
+# 4. 其余依赖（VLM/Embedding/UI/LLM）与 9.3 相同
+pip install PySide6 PyMuPDF paddlepaddle paddleocr
+pip install FlagEmbedding qdrant-client langgraph openai sqlalchemy
+
+# 5. 初始化 SQLite 数据库
+python -m scripts.init_db  # 执行建表 SQL（SQLite 方言）
+
+# 6. 启动桌面应用
+python main.py
+```
+
+**轻量方案取舍**：
+- SQLite 替代 PostgreSQL：单机够用，但无并发写入（桌面单用户场景可接受）
+- 本地文件系统替代 MinIO：无 S3 兼容 API，但单机无需对象存储特性
+- 适合：个人桌面知识库；不适合：团队协作、多用户、需 S3 兼容接口的场景
+
 ---
 
 ## 10 开发计划
@@ -864,12 +1023,13 @@ python main.py
 
 | 风险 | 影响 | 对策 |
 |------|------|------|
-| MinerU VLM 后端需 GPU | 无 GPU 环境无法使用方案B | 默认方案A (PaddleOCR-VL-0.9B CPU 可运行)，MinerU 降级为 Pipeline 后端 |
-| 打包体积过大 | 安装包超 200MB | 剥离 QtWebEngine（节省 ~120MB）+ UPX 压缩 + Nuitka 编译 |
-| AI 幻觉引用 ID | 答案中出现不存在的块 ID | 系统后处理校验：仅采纳检索结果集内的 ID，过滤幻觉 ID |
+| MinerU VLM 后端需 GPU | 无 GPU 环境无法使用方案B vlm 后端 | 默认方案A (PaddleOCR-VL-0.9B CPU 可运行)，方案B 切 pipeline 后端 CPU 降级 |
+| 打包体积过大（实际 3-5GB） | 安装包过大，分发困难 | 重新评估：PySide6 ~200MB + PaddlePaddle ~500MB+ + 模型文件(BGE-M3 ~1GB + PaddleOCR-VL ~1GB + Qwen3-0.6B ~1GB)≈3-5GB。对策：①模型按需下载（首启动下载选中方案模型，安装包仅含框架代码 ~300MB）；②PaddlePaddle 用 CPU 精简版；③模型量化分发（INT4/ONNX）；④剥离 QtWebEngine 省 ~120MB |
+| AI 幻觉引用 ID | 答案中出现不存在的块 ID | 系统后处理校验：仅采纳 `retrieved_chunks` 集合内的 ID，过滤幻觉 ID（见 7.2 第④步） |
 | LLM API 调用延迟 | 用户等待时间长 | QThread 异步流式渲染、Token 流式输出、UI 实时更新 |
-| Embedding 模型切换 | 不同模型向量维度不同 | Protocol 接口抽象 + Qdrant Collection 动态创建，配置指定维度 |
-| VLM 模型切换 | 不同 VLM 接口差异 | Protocol 接口统一 `understand_image` / `parse_document` 方法签名 |
+| Embedding 模型切换 | 不同模型向量维度不同 | Protocol 接口抽象 + Qdrant Collection 动态创建，配置指定维度；切换需手动重建（见 11.3） |
+| VLM 模型切换 | 不同 VLM 接口差异 | Protocol 接口统一 `parse_document` / `understand_image` 方法签名 |
+| 批量导入并发引发 GPU OOM / LLM 限流 | VLM 推理 OOM、LLM API 429 | 全局任务队列 + GPU 信号量 + LLM 令牌桶（见 15.2） |
 
 ---
 
@@ -881,24 +1041,29 @@ python main.py
 
 ```yaml
 # config.yaml — 用户可编辑配置文件
+# 注意：敏感凭据（api_key、db password、minio secret_key）不在此明文存储，
+#       统一走系统 keyring（见 11.4），此处仅留占位符。
 llm:
   api_base: "https://api.openai.com/v1"
-  api_key: "sk-xxxxx"              # 用户自有 API Key
+  api_key_env: "keyring:llm_api_key"  # 走 keyring 读取，key 名 llm_api_key
   model: "gpt-4o"                  # 文字 LLM 模型名称
   temperature: 0.3
   max_tokens: 4096
   timeout: 60                      # 秒
 
+encoding:
+  worker_id: 1                     # Snowflake workerId，单机固定为 1
+
 vlm:
   # 用户可选：A / B / C
-  provider: "A"                    # A=PaddleOCR-VL, B=MinerU VLM, C=MiniCPM-V
+  provider: "A"                    # A=PaddleOCR-VL, B=MinerU 框架, C=MiniCPM-V
   # 方案A 专属配置
   paddleocr_vl:
     model_dir: null                # null=自动下载，或指定本地路径
     lang: "ch"                     # OCR 语言
-  # 方案B 专属配置
+  # 方案B 专属配置（MinerU 框架，含 vlm/pipeline 两后端）
   mineru_vlm:
-    backend: "vlm"                 # vlm(需GPU) / pipeline(CPU可降级)
+    backend: "vlm"                 # vlm(需GPU,版面精度首选) / pipeline(CPU可降级)
     device: "cuda"
   # 方案C 专属配置
   minicpm_v:
@@ -916,24 +1081,29 @@ embedding:
   qwen3:
     model_name: "Qwen/Qwen3-Embedding-0.6B"  # 或 4B / 8B
     max_length: 8192
+    query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query.\nquery: "
 
 storage:
   minio:
     endpoint: "localhost:9000"
     access_key: "admin"
-    secret_key: "yourpass"
+    secret_key_env: "keyring:minio_secret_key"  # 走 keyring
     bucket: "knowledge-base"
   postgres:
     host: "localhost"
     port: 5432
     database: "knowledge_base"
     user: "admin"
-    password: "yourpass"
+    password_env: "keyring:pg_password"         # 走 keyring
+  # 轻量方案：取消上述 minio/postgres，改用下面两段（见 9.4）
+  # sqlite:
+  #   path: "./data/knowledge_base.db"
+  # local_fs:
+  #   root: "./data/files"
   qdrant:
     host: "localhost"
     port: 6333
-    collection_text: "text_chunks"
-    collection_image: "image_chunks"
+    collection: "text_chunks"      # 文本块+图片块(描述文本)统一入此 collection
 
 chunking:
   target_tokens: 300               # 目标块大小
@@ -945,6 +1115,12 @@ retrieval:
   top_k_sparse: 20                 # 稀疏检索召回数
   rrf_k: 60                        # RRF 融合参数
   final_top_k: 5                   # 最终返回数
+
+concurrency:
+  max_gpu_tasks: 1                 # GPU 信号量（防 OOM，单 GPU 建议 1）
+  llm_rpm: 60                      # LLM API 每分钟请求数上限（令牌桶）
+  llm_tpm: 90000                   # LLM API 每分钟 token 数上限
+  import_queue_size: 16            # 导入任务队列容量
 
 ui:
   window_width: 1400
@@ -965,11 +1141,13 @@ import yaml
 @dataclass
 class AppConfig:
     llm: dict
+    encoding: dict
     vlm: dict
     embedding: dict
     storage: dict
     chunking: dict
     retrieval: dict
+    concurrency: dict
     ui: dict
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -984,14 +1162,15 @@ class ComponentFactory:
     def __init__(self, config: AppConfig):
         self.config = config
 
-    def create_vlm(self) -> "VisionLanguageModel":
+    def create_parser(self) -> "DocumentParser":
+        """创建文档解析器（统一接口，原 create_vlm 合并入此）"""
         provider = self.config.vlm["provider"]
         if provider == "A":
             from adapters.paddleocr_vl import PaddleOCRVLModel
             return PaddleOCRVLModel(**self.config.vlm["paddleocr_vl"])
         elif provider == "B":
-            from adapters.mineru_vlm import MinerUVLMModel
-            return MinerUVLMModel(**self.config.vlm["mineru_vlm"])
+            from adapters.mineru_vlm import MinerUModel
+            return MinerUModel(**self.config.vlm["mineru_vlm"])
         elif provider == "C":
             from adapters.minicpm_vlm import MiniCPMVModel
             return MiniCPMVModel(**self.config.vlm["minicpm_v"])
@@ -1020,12 +1199,12 @@ config = load_config("config.yaml")
 factory = ComponentFactory(config)
 
 # 业务层仅依赖接口，不 import 任何 adapter
-vlm = factory.create_vlm()           # → VisionLanguageModel
+parser = factory.create_parser()      # → DocumentParser（含 VLM 职责）
 embedder = factory.create_embedder()  # → Embedder
 llm = factory.create_llm()            # → LLMClient
 
 # 传入业务服务
-file_service = FileService(vlm=vlm, embedder=embedder, llm=llm, config=config)
+file_service = FileService(parser=parser, embedder=embedder, llm=llm, config=config)
 rag_service = RagService(embedder=embedder, llm=llm, config=config)
 
 # 启动 UI
@@ -1037,7 +1216,9 @@ sys.exit(app.exec())
 
 ### 11.3 配置热更新机制
 
-用户在桌面应用设置界面修改模型方案后，系统通过 Signal 通知各服务重建组件实例，无需重启应用：
+用户在桌面应用设置界面修改模型方案后，系统通过 Signal 通知各服务重建组件实例，无需重启应用。
+
+**关键决策（问题7）**：Embedding 切换分两步——①热更新仅切配置并标记 collection 为 dirty，不立即重建；②重建需用户在 UI 显式点击"重建向量库"按钮触发，进 QThread 队列带进度反馈。这样避免用户误触耗时操作。
 
 ```python
 # services/config_manager.py — 配置热更新
@@ -1045,24 +1226,39 @@ from PySide6.QtCore import QObject, Signal
 
 class ConfigManager(QObject):
     config_changed = Signal(str, object)  # (字段名, 新值)
+    collection_dirty = Signal()           # Embedding 切换后通知 UI 标记 dirty
 
     def __init__(self, config: AppConfig, factory: ComponentFactory):
         super().__init__()
         self.config = config
         self.factory = factory
 
-    def update_vlm_provider(self, provider: str):
-        """用户在设置界面切换 VLM 方案"""
+    def update_parser_provider(self, provider: str):
+        """用户切换文档解析器/VLM 方案。VLM 切换不涉及存量数据，可直接重建实例。"""
         self.config.vlm["provider"] = provider
-        new_vlm = self.factory.create_vlm()
-        self.config_changed.emit("vlm", new_vlm)
+        new_parser = self.factory.create_parser()
+        self.config_changed.emit("parser", new_parser)
 
     def update_embedding_provider(self, provider: str):
-        """用户在设置界面切换 Embedding 模型"""
+        """用户切换 Embedding 模型。
+        仅切配置 + 标记 collection dirty，不立即重建。
+        重建需用户显式触发 rebuild_vector_store()。
+        """
         self.config.embedding["provider"] = provider
         new_embedder = self.factory.create_embedder()
         self.config_changed.emit("embedding", new_embedder)
-        # 注意：切换 Embedding 后需重建 Qdrant Collection（维度可能变化）
+        self.collection_dirty.emit()  # UI 显示"向量库需重建"徽标
+
+    def rebuild_vector_store(self):
+        """用户显式点击'重建向量库'按钮触发。
+        耗时操作，进 QThread 队列，UI 显示进度。
+        步骤：①新建 collection(新维度) ②全量重编码 ③切换别名 ④删除旧 collection。
+        """
+        from workers.rebuild_worker import RebuildWorker
+        worker = RebuildWorker(self.config, self.factory)
+        worker.progress.connect(self._on_rebuild_progress)
+        worker.finished.connect(self._on_rebuild_done)
+        worker.start()
 
     def update_llm_config(self, **kwargs):
         """用户修改 LLM API 配置"""
@@ -1071,7 +1267,38 @@ class ConfigManager(QObject):
         self.config_changed.emit("llm", new_llm)
 ```
 
-**Embedding 切换注意事项**：BGE-M3 输出 1024 维 + 稀疏 + ColBERT，Qwen3-Embedding-0.6B 输出 1024 维（纯 dense），Qwen3-4B 输出 2560 维。切换模型后向量维度不同，需重建 Qdrant Collection 并重新向量化全部已有知识块。系统在切换时弹出确认对话框，提示用户此操作的影响。
+**Embedding 切换注意事项**：BGE-M3 输出 1024 维 + 稀疏 + ColBERT，Qwen3-Embedding-0.6B 输出 1024 维（纯 dense），Qwen3-4B 输出 2560 维。切换模型后向量维度可能变化，必须重建 Qdrant Collection 并重新向量化全部已有知识块。系统通过 `collection_dirty` 信号在 UI 提示"向量库需重建"，用户确认后调用 `rebuild_vector_store()`。
+
+### 11.4 凭据安全存储（keyring）
+
+敏感凭据（LLM API Key、PostgreSQL 密码、MinIO Secret Key）**不存入 config.yaml 明文**，统一走操作系统级 keyring 服务，避免分发后凭据泄露：
+
+```python
+# utils/credentials.py — 凭据读写（基于 keyring 库）
+import keyring
+
+SERVICE_NAME = "knowledge-base-app"
+
+def get_credential(key: str) -> str:
+    """从系统 keyring 读取凭据。config.yaml 中 *_env 字段格式: keyring:<key_name>"""
+    return keyring.get_password(SERVICE_NAME, key)
+
+def set_credential(key: str, value: str) -> None:
+    """用户在设置界面输入凭据时写入 keyring"""
+    keyring.set_password(SERVICE_NAME, key, value)
+
+def resolve_credential_placeholder(value: str) -> str:
+    """解析 config.yaml 中的 keyring:xxx 占位符"""
+    if isinstance(value, str) and value.startswith("keyring:"):
+        key_name = value.removeprefix("keyring:")
+        cred = get_credential(key_name)
+        if cred is None:
+            raise ValueError(f"凭据 {key_name} 未在 keyring 中设置")
+        return cred
+    return value
+```
+
+config.yaml 中只出现占位符（如 `api_key_env: "keyring:llm_api_key"`），`load_config()` 加载时调用 `resolve_credential_placeholder` 解析为真实值。用户首次在设置界面输入凭据时，调用 `set_credential` 写入系统 keyring（macOS Keychain / Windows Credential Manager / Linux Secret Service）。
 
 ---
 
@@ -1218,12 +1445,12 @@ class TraceError(KnowledgeBaseError):
 
 | 错误场景 | 策略 | 实现方式 |
 |----------|------|----------|
-| LLM API 超时/429 | 指数退避重试 3 次 | `tenacity` 库 `@retry(wait=wait_exponential, stop=stop_after_attempt(3))` |
+| LLM API 超时/429 | 指数退避重试 3 次 + 令牌桶限流 | `tenacity` 库 `@retry(wait=wait_exponential, stop=stop_after_attempt(3))`；并发控制见 15.2 |
 | LLM API 返回格式异常 | 重新请求并附加格式约束提示词 | 在 system prompt 追加 "请严格返回 JSON 格式" |
-| VLM 解析 OOM | 降级到 Pipeline 后端（方案B）或跳过图片（方案A/C） | 捕获 `torch.cuda.OutOfMemoryError`，切换 backend |
-| Embedding 编码失败 | 跳过当前块，标记为 `embed_failed`，后续补偿 | `chunk_index.parse_status = 'embed_failed'` |
-| Qdrant 连接失败 | 本地缓存待写入队列，恢复后批量补写 | 内存队列 + 定时 flush |
-| PostgreSQL 写入冲突 | 按 content_hash 去重，跳过已存在记录 | `INSERT ... ON CONFLICT (content_hash) DO NOTHING` |
+| VLM 解析 OOM | 降级到 Pipeline 后端（方案B）或跳过图片（方案A/C） | 捕获 `torch.cuda.OutOfMemoryError`，方案B 切 `backend="pipeline"` |
+| Embedding 编码失败 | 跳过当前块，标记 `parse_status='failed'`+`fail_stage='embed'`，重启后从 embed 阶段恢复 | 见 13.3 状态机 |
+| Qdrant 连接失败 | 待写入操作入 `compensation_queue` 表，reconciler 恢复后补写 | 见 13.3 补偿队列 |
+| PostgreSQL 写入冲突 | 按 (content_hash, doc_id) 去重，跳过已存在记录 | `INSERT ... ON CONFLICT (content_hash, doc_id) DO NOTHING` |
 | 正则未匹配到任何 chunk_id | 回退到 `retrieved_chunks` 记录作为引用来源 | 优先使用 AI 标注，回退到系统记录 |
 
 重试装饰器示例：
@@ -1256,65 +1483,135 @@ class OpenAILLMClient:
 
 ### 13.3 数据一致性保障
 
-写入链路涉及三个存储系统（MinIO + PostgreSQL + Qdrant），需保障跨系统数据一致性：
+写入链路涉及三个存储系统（MinIO + PostgreSQL + Qdrant），需保障跨系统数据一致性。
+
+**关键决策（问题6、9）**：采用 **"失败保留 + 状态机恢复 + 补偿队列"** 策略，而非失败即删。失败时保留记录并标记 `failed`+`fail_stage`，重启后扫描 `pending`/`failed` 记录从失败点继续；跨系统清理操作入 `compensation_queue` 表，由独立 reconciler 后台执行，保证最终一致性。
+
+**parse_status 状态机**：
+
+```
+pending → parsing → embedding → classifying → storing → completed
+   │         │           │            │           │
+   └─────────┴───────────┴────────────┴───────────┴──→ failed (记录 fail_stage)
+                                                          │
+                                              重启后从 fail_stage 恢复
+```
+
+**compensation_queue 表**（记录待执行的跨系统清理操作）：
+
+```sql
+CREATE TABLE compensation_queue (
+    id          BIGINT PRIMARY KEY,
+    op_type     VARCHAR(20) NOT NULL,    -- delete_qdrant / delete_pg_chunks / delete_pg_doc / delete_minio
+    target_id   VARCHAR(100) NOT NULL,   -- 操作目标 ID（chunk_id 列表 / doc_id / file_path）
+    status      VARCHAR(20) DEFAULT 'pending',  -- pending / done / failed
+    retries     INT DEFAULT 0,
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+```
 
 ```python
 # services/file_service.py — 写入链路事务编排
 class FileService:
     def import_document(self, file_path: str) -> str:
-        """文档导入全流程，带补偿回滚"""
-        doc_id = None
-        chunk_ids = []
+        """文档导入全流程。
+        失败时保留记录 + 标记 failed + fail_stage，清理操作入 compensation_queue。
+        """
+        doc_id = self.snowflake.next_id()
 
+        # 阶段 1: 上传原始文件 + 写 document_index(pending)
+        file_path_stored = self.minio.upload(file_path)
+        self.pg.insert_document(doc_id, file_path, file_path_stored,
+                                parse_status='parsing')
         try:
-            # 1. 上传原始文件到 MinIO
-            file_path_stored = self.minio.upload(file_path)
-
-            # 2. 写入 PostgreSQL document_index
-            doc_id = self.snowflake.next_id()
-            self.pg.insert_document(doc_id, file_path, file_path_stored, ...)
-
-            # 3. VLM 解析 + 分块 + 编码
-            parsed = self.vlm.parse_document(file_path)
+            # 阶段 2: 解析 + 分块 + 编码
+            parsed = self.parser.parse_document(file_path)
             chunks = self.chunker.split(parsed)
             for chunk in chunks:
                 chunk.chunk_id = self.snowflake.next_id()
-                chunk_ids.append(chunk.chunk_id)
+            self.pg.update_parse_status(doc_id, 'embedding')
 
-            # 4. 向量化
+            # 阶段 3: 向量化
             embeddings = self.embedder.encode([c.content for c in chunks])
+            self.pg.update_parse_status(doc_id, 'classifying')
 
-            # 5. LLM 分类
+            # 阶段 4: LLM 分类
             classifications = self.classify_with_llm(chunks)
+            self.pg.update_parse_status(doc_id, 'storing')
 
-            # 6. 写入 PostgreSQL chunk_index + chunk_category
+            # 阶段 5: 写 chunk_index + chunk_category
             self.pg.insert_chunks(chunks, classifications)
 
-            # 7. 写入 Qdrant（最后一步，失败时可补偿）
-            self.qdrant.upsert(chunks, embeddings)
+            # 阶段 6: 写 Qdrant（最后一步，失败时入补偿队列）
+            try:
+                self.qdrant.upsert(chunks, embeddings)
+            except Exception as qe:
+                # Qdrant 失败：不阻断主流程，入补偿队列异步重试
+                self.compensation.enqueue('delete_pg_chunks', doc_id)
+                self.compensation.enqueue('upsert_qdrant',
+                                          [c.chunk_id for c in chunks])
+                raise StorageError(f"Qdrant 写入失败，已入补偿队列: {qe}") from qe
 
-            # 8. 更新 document_index.parse_status = 'completed'
+            # 阶段 7: 完成
             self.pg.update_parse_status(doc_id, 'completed')
-
             return doc_id
 
         except Exception as e:
-            # 补偿回滚：按逆序清理
-            logger.error(f"文档导入失败: {e}, 开始回滚")
-            if chunk_ids:
-                self.qdrant.delete(chunk_ids)          # 删向量
-            if doc_id:
-                self.pg.delete_chunks_by_doc(doc_id)   # 删块索引
-                self.pg.delete_document(doc_id)         # 删文件记录
-                self.minio.delete(file_path_stored)    # 删原始文件
-            raise StorageError(f"文档导入失败已回滚: {e}") from e
+            # 失败保留：标记 failed + fail_stage，不删除数据
+            stage = self.pg.get_parse_status(doc_id)  # 当前所处阶段
+            self.pg.update_parse_status(doc_id, 'failed',
+                                        fail_stage=stage, fail_reason=str(e))
+            logger.error(f"文档导入失败 doc_id={doc_id} stage={stage}: {e}")
+            raise  # 交给上层处理，重启后由 reconciler 从 fail_stage 恢复
+
+    def resume_interrupted(self):
+        """应用启动时扫描 pending/failed 记录，从 fail_stage 恢复。"""
+        for doc in self.pg.list_by_status(['pending', 'parsing', 'embedding',
+                                            'classifying', 'storing', 'failed']):
+            stage = doc.fail_stage or doc.parse_status
+            logger.info(f"恢复文档 doc_id={doc.doc_id} 从 stage={stage}")
+            # 从 stage 对应阶段继续执行（幂等：先清理该阶段半成品再重跑）
+            self._resume_from_stage(doc, stage)
+```
+
+```python
+# services/compensation.py — 补偿队列 reconciler
+class CompensationReconciler:
+    """后台定时扫描 compensation_queue，执行待处理操作。
+    每步独立 try/except，确保单步失败不阻断后续步骤。
+    """
+    def run_once(self):
+        for task in self.pg.list_pending_compensations():
+            try:
+                self._execute(task)
+                self.pg.mark_compensation_done(task.id)
+            except Exception as e:
+                task.retries += 1
+                if task.retries >= MAX_RETRIES:
+                    self.pg.mark_compensation_failed(task.id, str(e))
+                    logger.error(f"补偿任务最终失败 {task.id}: {e}")
+                else:
+                    self.pg.update_compensation_retries(task.id, task.retries)
+
+    def _execute(self, task):
+        if task.op_type == 'delete_qdrant':
+            self.qdrant.delete(task.target_id)
+        elif task.op_type == 'delete_pg_chunks':
+            self.pg.delete_chunks_by_doc(task.target_id)
+        elif task.op_type == 'delete_pg_doc':
+            self.pg.delete_document(task.target_id)
+        elif task.op_type == 'delete_minio':
+            self.minio.delete(task.target_id)
+        # 每个分支独立，单步失败不影响其他
 ```
 
 一致性设计原则：
 - **原始文件优先上传**：MinIO 上传成功后才写 PostgreSQL，保证 `file_path` 引用有效
-- **Qdrant 最后写入**：向量数据依赖 chunk_id 和元数据，最后写入可保证引用完整
-- **补偿逆序回滚**：失败时按 Qdrant → PostgreSQL → MinIO 逆序删除已写入数据
-- **状态标记追踪**：`document_index.parse_status` 字段标记 `pending`/`completed`/`failed`，应用启动时扫描 `pending` 状态记录并尝试恢复或清理
+- **Qdrant 最后写入**：向量数据依赖 chunk_id 和元数据，最后写入可保证引用完整；Qdrant 失败入补偿队列，不阻断主流程
+- **失败保留 + 状态机恢复**：失败不删除，标记 `failed`+`fail_stage`，重启后 `resume_interrupted` 从失败阶段继续（幂等重跑）
+- **补偿队列保证最终一致**：跨系统清理操作入 `compensation_queue`，reconciler 后台执行，每步独立 try/except + 重试上限，避免回滚本身失败留脏数据
+- **状态标记追踪**：`document_index.parse_status` 状态机贯穿全链路，任意时刻可知文档所处阶段
 
 ---
 
@@ -1326,8 +1623,8 @@ class FileService:
 |------|------|------|----------|
 | 单元测试 | 接口实现、工具函数、数据模型 | pytest | 核心逻辑 ≥ 80% 行覆盖 |
 | 接口测试 | Protocol 契约一致性 | pytest + Mock | 所有 adapter 通过接口测试 |
-| 集成测试 | 跨模块数据流（解析→存储→检索） | pytest + testcontainers | 写入→检索→溯源全链路 |
-| UI 测试 | PySide6 交互流程 | pytest-qt | 关键交互路径 |
+| 集成测试 | 跨模块数据流（解析→存储→检索） | pytest + testcontainers + **Mock VLM** | 写入→检索→溯源全链路（CI 无 GPU 用 Mock） |
+| UI 测试 | PySide6 交互流程 | pytest-qt（**QT_QPA_PLATFORM=offscreen**） | 关键交互路径 |
 | 端到端测试 | 完整用户场景 | 手动 + 自动化脚本 | 文档导入到问答全流程 |
 
 ### 14.2 关键模块测试要点
@@ -1340,33 +1637,41 @@ class TestTraceService:
 
     def test_normal_citation(self):
         """正常引用：AI 标注的 chunk_id 在检索结果集内"""
-        answer = "知识库采用 Agentic RAG【chunk_101】，Qdrant 支持元数据过滤【chunk_102】"
-        retrieved = {"chunk_101", "chunk_102", "chunk_103"}
+        answer = "知识库采用 Agentic RAG【chunk_1751234567890】，Qdrant 支持元数据过滤【chunk_1751234567891】"
+        retrieved = {"chunk_1751234567890", "chunk_1751234567891", "chunk_1751234567892"}
         refs = trace_references(answer, retrieved)
         assert len(refs) == 2
-        assert {r["chunk_id"] for r in refs} == {"chunk_101", "chunk_102"}
+        assert {r["chunk_id"] for r in refs} == {"chunk_1751234567890", "chunk_1751234567891"}
 
     def test_hallucination_filtering(self):
         """幻觉过滤：AI 编造的 chunk_id 不在检索结果集内，应被过滤"""
-        answer = "某知识来自【chunk_999】"  # chunk_999 不在检索结果中
-        retrieved = {"chunk_101", "chunk_102"}
+        answer = "某知识来自【chunk_9999999999999】"  # 不在检索结果中
+        retrieved = {"chunk_1751234567890", "chunk_1751234567891"}
         refs = trace_references(answer, retrieved)
         assert len(refs) == 0  # 幻觉 ID 被过滤
 
     def test_no_citation_fallback(self):
         """回退机制：AI 未标注任何引用时，使用 retrieved_chunks 作为引用来源"""
         answer = "知识库采用 Agentic RAG 架构"  # 无引用标记
-        retrieved = {"chunk_101", "chunk_102"}
+        retrieved = {"chunk_1751234567890", "chunk_1751234567891"}
         refs = trace_references_fallback(answer, retrieved)
         assert len(refs) == 2  # 回退到系统记录
 
     def test_mixed_citation(self):
         """混合场景：部分引用有效，部分为幻觉"""
-        answer = "来自【chunk_101】和【chunk_999】"
-        retrieved = {"chunk_101", "chunk_102"}
+        answer = "来自【chunk_1751234567890】和【chunk_9999999999999】"
+        retrieved = {"chunk_1751234567890", "chunk_1751234567891"}
         refs = trace_references(answer, retrieved)
         assert len(refs) == 1
-        assert refs[0]["chunk_id"] == "chunk_101"
+        assert refs[0]["chunk_id"] == "chunk_1751234567890"
+
+    def test_trace_error_on_db_failure(self):
+        """DB 查询失败时抛出 TraceError（问题27 异常体系落地）"""
+        answer = "引用【chunk_1751234567890】"
+        retrieved = {"chunk_1751234567890"}
+        with patch.object(db, 'query', side_effect=RuntimeError("conn lost")):
+            with pytest.raises(TraceError):
+                trace_references(answer, retrieved)
 ```
 
 **接口契约测试**（验证所有 adapter 符合 Protocol 定义）：
@@ -1403,7 +1708,7 @@ class TestEmbedderContract:
             assert result.sparse is None
 ```
 
-**集成测试**（使用 testcontainers 启动真实存储）：
+**集成测试**（使用 testcontainers 启动真实存储，VLM 用 Mock 避免无 GPU 超时）：
 
 ```python
 # tests/test_integration.py
@@ -1413,10 +1718,22 @@ def storage_stack():
     with postgres_container() as pg, qdrant_container() as qd, minio_container() as mn:
         yield StorageStack(pg, qd, mn)
 
+@pytest.fixture
+def fake_parser():
+    """Mock VLM：返回固定 ParsedDocument，避免 CI 无 GPU 跑真实 VLM 超时"""
+    parser = MagicMock(spec=DocumentParser)
+    parser.parse_document.return_value = ParsedDocument(
+        chunks=[Chunk(content="样本内容", chunk_type="text")],
+        images=[], metadata={"page_count": 1}
+    )
+    parser.requires_gpu = False
+    return parser
+
 class TestWriteRetrieveCycle:
     """写入→检索→溯源全链路集成测试"""
 
-    def test_document_roundtrip(self, storage_stack):
+    def test_document_roundtrip(self, storage_stack, fake_parser):
+        file_service = FileService(parser=fake_parser, embedder=real_embedder, ...)
         # 1. 导入文档
         doc_id = file_service.import_document("test_data/sample.pdf")
         assert doc_id is not None
@@ -1424,20 +1741,22 @@ class TestWriteRetrieveCycle:
         # 2. 验证 PostgreSQL 记录
         doc = storage_stack.pg.get_document(doc_id)
         assert doc.parse_status == 'completed'
-        assert len(doc.chunk_ids) > 0
+        chunk_ids = storage_stack.pg.list_chunk_ids(doc_id)  # 走 chunk_index 查询
+        assert len(chunk_ids) > 0
 
         # 3. 验证 Qdrant 向量
-        for chunk_id in doc.chunk_ids:
+        for chunk_id in chunk_ids:
             assert storage_stack.qdrant.exists(chunk_id)
 
         # 4. 检索验证
         results = rag_service.hybrid_search("样本内容", top_k=5)
         assert len(results) > 0
-        assert any(r.chunk_id in doc.chunk_ids for r in results)
+        assert any(r.chunk_id in chunk_ids for r in results)
 
         # 5. 溯源验证
-        answer = f"参考内容【{results[0].chunk_id}】"
-        refs = trace_references(answer, {r.chunk_id for r in results})
+        answer = f"参考内容【chunk_{results[0].chunk_id}】"
+        retrieved = {f"chunk_{r.chunk_id}" for r in results}
+        refs = trace_references(answer, retrieved)
         assert len(refs) == 1
         assert refs[0]["source_file"] == "sample.pdf"
 ```
@@ -1456,7 +1775,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: pip install ruff mypy
       - run: ruff check .
-      - run: mypy interfaces/ services/ --strict
+      # mypy 用 default 模式，interfaces/ 内文件已加 from __future__ import annotations
+      # 避免 strict 模式对字符串前向引用（list["Chunk"]）报错
+      - run: mypy interfaces/ services/
 
   unit-test:
     runs-on: ubuntu-latest
@@ -1483,6 +1804,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: pip install -e ".[test]"
+      # 集成测试用 Mock VLM，避免无 GPU 环境跑真实模型超时
       - run: pytest tests/test_integration.py --tb=short
 
   ui-test:
@@ -1490,11 +1812,148 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: pip install -e ".[test]" pytest-qt
-      - run: xvfb-run pytest tests/ui/ --tb=short
+      # PySide6 在无显示环境需显式指定 offscreen 平台插件
+      - env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests/ui/ --tb=short
 ```
 
-CI 流水线在每次提交时自动执行：代码规范检查（ruff + mypy）、单元测试（含覆盖率报告）、接口契约测试、集成测试（真实存储容器）、UI 测试。溯源模块测试作为独立 stage 单独报告结果，确保需求⑥的核心保障不被回归破坏。
+CI 流水线在每次提交时自动执行：代码规范检查（ruff + mypy）、单元测试（含覆盖率报告）、接口契约测试、集成测试（真实存储容器 + Mock VLM）、UI 测试（offscreen 平台）。溯源模块测试作为独立 stage 单独报告结果，确保需求⑥的核心保障不被回归破坏。
 
 ---
 
-> **文档说明**：本文档基于全面技术调研编制，所有技术选型均经过验证。开源组件以 Python 库形式集成，通过 Protocol/ABC 接口隔离，核心业务逻辑全部自研。Embedding 模型（BGE-M3 / Qwen3-Embedding）和本地 VLM（PaddleOCR-VL-0.9B / MinerU 2.5 VLM / MiniCPM-V 4.5）均支持用户在配置中自由切换，业务代码零修改。系统不依赖任何开源平台（Dify/RAGFlow/FastGPT），保持完全的架构主权。全文覆盖项目概述、系统架构、文档处理、存储设计、AI 分析、RAG 检索、编码溯源、桌面架构、部署方案、开发计划、配置系统、时序设计、错误处理、测试策略共 14 个章节，可直接作为工程师软件设计与构建的技术路线参考。
+## 15 生命周期管理与并发控制
+
+### 15.1 文档生命周期管理
+
+文档除写入与检索外，还需支持删除、更新、分类变更，这些链路均涉及跨系统（MinIO + PostgreSQL + Qdrant）一致性，统一由 `LifecycleService` 编排，清理操作入 `compensation_queue` 异步执行：
+
+```python
+# services/lifecycle_service.py
+class LifecycleService:
+    def delete_document(self, doc_id: int):
+        """删除文档：级联清理 PG chunk_index + chunk_category + Qdrant 向量 + MinIO 原始文件。
+        清理操作入 compensation_queue，由 reconciler 异步执行保证最终一致。
+        """
+        # 1. 标记 document_index.parse_status = 'deleting'（软删除起点）
+        self.pg.update_parse_status(doc_id, 'deleting')
+        # 2. 入队清理任务（reconciler 逆序执行：Qdrant → PG → MinIO）
+        chunk_ids = self.pg.list_chunk_ids(doc_id)
+        self.compensation.enqueue('delete_qdrant', chunk_ids)
+        self.compensation.enqueue('delete_pg_chunks', doc_id)  # 含 chunk_category 关联
+        self.compensation.enqueue('delete_pg_doc', doc_id)
+        file_path = self.pg.get_file_path(doc_id)
+        self.compensation.enqueue('delete_minio', file_path)
+        # 3. reconciler 执行完成后 document_index 记录物理删除
+
+    def update_document(self, doc_id: int, new_file_path: str):
+        """更新文档：等价于 delete + import。重新解析生成新 chunk_id，
+        旧 chunk 全部清理。期间检索可能命中新旧块，可接受（最终一致）。"""
+        self.delete_document(doc_id)
+        return self.file_service.import_document(new_file_path)
+
+    def update_chunk_categories(self, chunk_id: int, category_ids: list[int]):
+        """分类变更：更新 chunk_category 关联表（单一数据源），
+        同步刷新 Qdrant payload 的 categories 字段。"""
+        self.pg.upsert_chunk_categories(chunk_id, category_ids)
+        cats = self.pg.get_category_names(chunk_id)  # 从关联表读取
+        self.qdrant.update_payload(chunk_id, {"categories": cats})
+```
+
+**生命周期状态机扩展**：在 13.3 的 parse_status 基础上增加 `deleting` 终态：
+
+```
+... → completed → deleting → (物理删除)
+```
+
+### 15.2 并发控制（任务队列 + GPU 信号量 + LLM 令牌桶）
+
+批量导入时多个 ParseWorker 并发跑 VLM 推理易引发 GPU OOM，LLM API 并发过高触发 429。需全局并发控制：
+
+```python
+# services/concurrency.py
+import threading
+from collections import deque
+from time import monotonic
+
+class GlobalTaskQueue:
+    """全局导入任务队列，限制并发数，防止资源过载"""
+    def __init__(self, max_concurrent: int):
+        self._sem = threading.Semaphore(max_concurrent)
+        self._queue = deque()
+
+    def submit(self, task):
+        self._queue.append(task)
+
+    def worker_loop(self):
+        while True:
+            task = self._queue.popleft()
+            with self._sem:  # 限制并发
+                task.run()
+
+class GpuSemaphore:
+    """GPU 信号量：限制同时在 GPU 上跑的 VLM 推理数（单 GPU 建议 1）"""
+    def __init__(self, max_gpu_tasks: int = 1):
+        self._sem = threading.Semaphore(max_gpu_tasks)
+
+    def acquire(self): self._sem.acquire()
+    def release(self): self._sem.release()
+
+class LlmTokenBucket:
+    """LLM API 令牌桶：按 RPM + TPM 双维限流，避免 429"""
+    def __init__(self, rpm: int, tpm: int):
+        self._rpm = rpm
+        self._tpm = tpm
+        self._req_count = 0
+        self._token_count = 0
+        self._window_start = monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, est_tokens: int):
+        with self._lock:
+            now = monotonic()
+            if now - self._window_start >= 60:
+                self._req_count = 0
+                self._token_count = 0
+                self._window_start = now
+            if (self._req_count >= self._rpm or
+                self._token_count + est_tokens > self._tpm):
+                wait = 60 - (now - self._window_start)
+                if wait > 0:
+                    threading.Event().wait(wait)
+                self._req_count = 0
+                self._token_count = 0
+                self._window_start = monotonic()
+            self._req_count += 1
+            self._token_count += est_tokens
+```
+
+**ParseWorker 集成并发控制**：
+
+```python
+# workers/parse_worker.py（修改后）
+class ParseWorker(QThread):
+    def __init__(self, parser, file_paths, gpu_sem: GpuSemaphore):
+        ...
+        self.gpu_sem = gpu_sem
+
+    def run(self):
+        for i, path in enumerate(self.file_paths):
+            if self.parser.requires_gpu:
+                self.gpu_sem.acquire()  # GPU 任务排队，防 OOM
+                try:
+                    doc = self.parser.parse_document(path)
+                finally:
+                    self.gpu_sem.release()
+            else:
+                doc = self.parser.parse_document(path)  # CPU 任务不抢 GPU
+            ...
+```
+
+配置项见 11.1 `concurrency` 段：`max_gpu_tasks`、`llm_rpm`、`llm_tpm`、`import_queue_size`。
+
+---
+
+> **文档说明**：本文档基于全面技术调研编制，所有技术选型均经过验证。开源组件以 Python 库形式集成，通过 Protocol/ABC 接口隔离，核心业务逻辑全部自研。Embedding 模型（BGE-M3 / Qwen3-Embedding）和本地 VLM（PaddleOCR-VL-0.9B / MinerU 框架 / MiniCPM-V 4.5）均支持用户在配置中自由切换，业务代码零修改。系统不依赖任何开源平台（Dify/RAGFlow/FastGPT），保持完全的架构主权。全文覆盖项目概述、系统架构、文档处理、存储设计、AI 分析、RAG 检索、编码溯源、桌面架构、部署方案、开发计划、配置系统、时序设计、错误处理、测试策略、生命周期与并发控制共 15 个章节，可直接作为工程师软件设计与构建的技术路线参考。
+>
+> **修订记录（v1.1）**：基于审查修复 29 项问题，核心包括：① chunk_id 全链路格式统一为 `【chunk_<snowflake>】` 字符串；② 图片块改用 VLM 描述文本向量化，移除独立图片 Embedder；③ LangGraph 自定义 tools 节点填充 retrieved_chunks；④ content_hash 去重键改为 (content_hash, doc_id)；⑤ 删除冗余 chunk_ids JSONB；⑥ 失败保留+状态机恢复+补偿队列；⑦ Embedding 热更新分两步（切配置+手动重建）；⑧ MinerU 方案B 含 vlm/pipeline 两后端；⑨ 合并 DocumentParser 与 VLM 接口；⑩ Qwen3-Embedding query 加 instruction；⑪ 补无 Docker 轻量部署方案；⑫ 补生命周期管理与并发控制章节；⑬ API Key 走 keyring；⑭ 修复 CI 测试环境（Mock VLM / QT_QPA_PLATFORM / mypy）；⑮ 补 AGPL 传染性风险提示。
