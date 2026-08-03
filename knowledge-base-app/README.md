@@ -13,7 +13,8 @@ knowledge-base-app/
 │   ├── parser.py           # DocumentParser（统一文档/图片解析，含 VLM 职责）
 │   ├── embedder.py         # Embedder（文本+图片描述统一）
 │   ├── vectorstore.py      # VectorStore
-│   └── llm.py              # LLMClient
+│   ├── llm.py              # LLMClient
+│   └── chunker.py          # Chunker + TokenCounter（结构感知分块）
 ├── adapters/               # 接口实现（可替换）
 │   ├── paddleocr_vl.py     # VLM 方案A：PaddleOCR-VL-0.9B（CPU 可运行）
 │   ├── mineru_vlm.py       # VLM 方案B：MinerU 框架（vlm/pipeline 两后端）
@@ -30,7 +31,8 @@ knowledge-base-app/
 │   ├── lifecycle_service.py# 删除/更新/分类变更
 │   ├── concurrency.py      # 全局队列+GPU 信号量+LLM 令牌桶
 │   ├── compensation.py     # 补偿队列 reconciler
-│   └── encoding.py         # Snowflake + SHA-256
+│   ├── encoding.py         # Snowflake + SHA-256
+│   └── chunker.py          # 结构感知分块器 + 字符 token 计数器
 ├── workers/                # QThread 后台工作线程
 │   ├── parse_worker.py     # 文档解析
 │   ├── embed_worker.py     # 向量化
@@ -54,12 +56,14 @@ knowledge-base-app/
     ├── test_encoding.py            # 编码服务测试
     ├── test_trace_service.py       # 溯源核心测试
     ├── test_interface_contracts.py # 接口契约测试
-    └── test_credentials.py         # 凭据解析测试
+    ├── test_credentials.py         # 凭据解析测试
+    └── test_chunker.py             # 分块器测试（结构感知 + overlap + 尾块合并）
 ```
 
 ## 关键设计
 
 - **chunk_id 格式统一**：DB 存 BIGINT，prompt/正则/集合统一 `chunk_<snowflake_id>` 字符串
+- **结构感知分块**：以 Markdown 标题/段落为原子单元，目标 200-400 tokens + 10-20% 重叠，图片/表格/公式块原样保留；标题为硬语义边界，尾块过小合并
 - **图片块向量化**：用 VLM 描述文本走文本 Embedding，无独立图片 Embedder
 - **系统级溯源**：自定义 tools 节点填充 `retrieved_chunks`，溯源过滤幻觉 ID
 - **失败保留+状态机恢复**：parse_status 七态，失败不删除，重启从 fail_stage 恢复
@@ -88,7 +92,6 @@ pytest tests/ -v
 ## 待实现（标注 TODO）
 
 - 真实 PG/MinIO/Qdrant 仓库层（pg_repo / minio_repo）
-- 文档分块器（chunker）
 - Qdrant 混合检索 + RRF 融合
 - 各 VLM adapter 的真实解析逻辑
 - 向量库重建 Worker 完整流程
