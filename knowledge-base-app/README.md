@@ -22,7 +22,7 @@ knowledge-base-app/
 │   ├── minicpm_vlm.py      # VLM 方案C：MiniCPM-V 4.5（需 GPU）
 │   ├── bge_embedder.py     # Embedding 方案A：BGE-M3（三模态）
 │   ├── qwen3_embedder.py   # Embedding 方案B：Qwen3-Embedding（纯 dense）
-│   ├── qdrant_store.py     # Qdrant 向量存储实现
+│   ├── qdrant_store.py     # Qdrant 向量存储实现（混合检索 + RRF 融合）
 │   └── openai_llm.py       # OpenAI 兼容 LLM 实现
 ├── services/               # 业务逻辑层（自研核心）
 │   ├── file_service.py     # 文件导入全流程编排
@@ -33,7 +33,8 @@ knowledge-base-app/
 │   ├── concurrency.py      # 全局队列+GPU 信号量+LLM 令牌桶
 │   ├── compensation.py     # 补偿队列 reconciler
 │   ├── encoding.py         # Snowflake + SHA-256
-│   └── chunker.py          # 结构感知分块器 + 字符 token 计数器
+│   ├── chunker.py          # 结构感知分块器 + 字符 token 计数器
+│   └── rrf_fusion.py       # RRF 倒数排名融合（混合检索 dense+sparse 融合）
 ├── workers/                # QThread 后台工作线程
 │   ├── parse_worker.py     # 文档解析
 │   ├── embed_worker.py     # 向量化
@@ -62,7 +63,8 @@ knowledge-base-app/
     ├── test_interface_contracts.py # 接口契约测试
     ├── test_credentials.py         # 凭据解析测试
     ├── test_chunker.py             # 分块器测试（结构感知 + overlap + 尾块合并）
-    └── test_object_storage.py      # 对象存储测试（LocalFSAdapter 全覆盖 + MinIO 契约）
+    ├── test_object_storage.py      # 对象存储测试（LocalFSAdapter 全覆盖 + MinIO 契约）
+    └── test_rrf_fusion.py          # RRF 融合测试（多路排名融合 + QdrantStore 契约）
 ```
 
 ## 关键设计
@@ -70,6 +72,7 @@ knowledge-base-app/
 - **chunk_id 格式统一**：DB 存 BIGINT，prompt/正则/集合统一 `chunk_<snowflake_id>` 字符串
 - **结构感知分块**：以 Markdown 标题/段落为原子单元，目标 200-400 tokens + 10-20% 重叠，图片/表格/公式块原样保留；标题为硬语义边界，尾块过小合并
 - **图片块向量化**：用 VLM 描述文本走文本 Embedding，无独立图片 Embedder
+- **混合检索+RRF 融合**：dense（cosine）+ sparse（BM25/客户端 sparse）两路检索，RRF 倒数排名融合（k=60），基于排名而非向量值，dense/sparse 分属不同向量空间不影响正确性
 - **系统级溯源**：自定义 tools 节点填充 `retrieved_chunks`，溯源过滤幻觉 ID
 - **失败保留+状态机恢复**：parse_status 七态，失败不删除，重启从 fail_stage 恢复
 - **补偿队列**：跨系统清理入 compensation_queue，reconciler 异步执行保证最终一致
@@ -96,8 +99,6 @@ pytest tests/ -v
 
 ## 待实现（标注 TODO）
 
-- 真实 PG/Qdrant 仓库层（pg_repo 已实现，Qdrant 待补）
-- Qdrant 混合检索 + RRF 融合
 - 各 VLM adapter 的真实解析逻辑
 - 向量库重建 Worker 完整流程
 - FileService._resume_from_stage 幂等恢复逻辑
