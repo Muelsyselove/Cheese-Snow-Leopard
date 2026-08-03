@@ -690,8 +690,12 @@ class MinerUModel:
     def parse_document(self, file_path: str) -> ParsedDocument:
         from mineru.cli.common import do_parse, read_fn  # API 以实际版本为准
         pdf_bytes = read_fn(file_path)
-        do_parse(output_dir="./tmp", pdf_bytes_list=[pdf_bytes],
-                 backend=self.backend, ...)
+        do_parse(
+            output_dir="./tmp",
+            pdf_bytes_list=[pdf_bytes],
+            backend=self.backend,
+        )
+        ...
         ...
 
     def understand_image(self, image_path: str, prompt: str) -> str:
