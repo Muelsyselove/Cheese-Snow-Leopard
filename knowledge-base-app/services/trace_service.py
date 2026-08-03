@@ -55,7 +55,6 @@ def trace_references(answer: str, retrieved_chunk_ids: set) -> list:
         # 字符串转 BIGINT 用于 DB 查询
         chunk_id_int = int(cid_str.removeprefix("chunk_"))
         try:
-            # TODO: 替换为真实的 db 查询
             chunk = _query_chunk(chunk_id_int)
         except Exception as e:
             raise TraceError(

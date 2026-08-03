@@ -101,8 +101,7 @@ def main():
     logger.info("补偿队列 reconciler 已启动")
 
     # 7. 扫描 pending/failed 文档恢复执行（后台异步）
-    # 注：_resume_from_stage 当前为骨架，FileService 装配已就绪，
-    #     待 _resume_from_stage 实现后即可启用完整恢复流程
+    # _resume_from_stage 已完整实现：storing/failed 清理半成品后重跑全流程
     def _resume():
         try:
             file_service = file_svc.FileService(
