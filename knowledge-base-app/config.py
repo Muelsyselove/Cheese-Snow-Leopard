@@ -24,12 +24,17 @@ class AppConfig:
     retrieval: dict
     concurrency: dict
     ui: dict
+    paths: dict = field(default_factory=dict)
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
     """加载配置文件并解析 keyring 占位符"""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
+    # 初始化数据路径（必须在创建任何组件前完成）
+    from utils.paths import init_paths
+    paths_cfg = data.get("paths") or {}
+    init_paths(paths_cfg.get("data_root"))
     # 递归解析 keyring:xxx 占位符
     data = _resolve_credentials(data)
     return AppConfig(
@@ -41,17 +46,26 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         chunking=data["chunking"],
         retrieval=data["retrieval"],
         concurrency=data.get("concurrency", {}),
-        ui=data.get("ui", {})
+        ui=data.get("ui", {}),
+        paths=paths_cfg,
     )
 
 
 def _resolve_credentials(obj):
-    """递归解析 dict/list 中的 keyring:xxx 占位符"""
+    """递归解析 dict/list 中的 keyring:xxx 占位符
+
+    缺失的 keyring 凭据返回空字符串而非抛异常，确保应用在未配置凭据时仍可启动。
+    """
     if isinstance(obj, dict):
         return {k: _resolve_credentials(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_resolve_credentials(v) for v in obj]
-    return resolve_credential_placeholder(obj)
+    if isinstance(obj, str) and obj.startswith("keyring:"):
+        try:
+            return resolve_credential_placeholder(obj)
+        except ValueError:
+            return ""
+    return obj
 
 
 class ComponentFactory:
@@ -151,7 +165,15 @@ class ComponentFactory:
         if "local_fs" in storage:
             from repositories import LocalFSAdapter
             cfg = storage["local_fs"]
-            return LocalFSAdapter(root=cfg.get("root", "./data/files"))
+            return LocalFSAdapter(root=cfg.get("root") or _default_files_root())
         # 默认回退到本地文件系统（无外部依赖，开箱即用）
         from repositories import LocalFSAdapter
-        return LocalFSAdapter(root="./data/files")
+        return LocalFSAdapter(root=_default_files_root())
+
+def _default_files_root() -> str:
+    """获取默认文件存储根目录（来自 paths.py）"""
+    try:
+        from utils.paths import get_files_root
+        return get_files_root()
+    except Exception:
+        return "./data/files"

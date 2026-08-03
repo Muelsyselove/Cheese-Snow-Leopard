@@ -1,87 +1,68 @@
-# config.yaml — 用户可编辑配置文件
-# 注意：敏感凭据（api_key、db password、minio secret_key）不在此明文存储，
-#       统一走系统 keyring（见 utils/credentials.py），此处仅留占位符。
-
 llm:
-  api_base: "https://api.openai.com/v1"
-  api_key_env: "keyring:llm_api_key"  # 走 keyring 读取，key 名 llm_api_key
-  model: "gpt-4o"
+  api_base: https://api.deepseek.com/v1
+  model: deepseek-v4-flash
   temperature: 0.3
   max_tokens: 4096
   timeout: 60
-
+  api_key: keyring:llm_api_key_deepseek
 encoding:
-  worker_id: 1                     # Snowflake workerId，单机固定为 1
-
+  worker_id: 1
+paths:
+  data_root: null
 vlm:
-  # 用户可选：A / B / C
-  provider: "A"                    # A=PaddleOCR-VL, B=MinerU 框架, C=MiniCPM-V
-  # 方案A 专属配置
+  provider: B
   paddleocr_vl:
-    model_dir: null                # null=自动下载，或指定本地路径
-    lang: "ch"
-  # 方案B 专属配置（MinerU 框架，含 vlm/pipeline 两后端）
+    model_dir: null
+    lang: ch
   mineru_vlm:
-    backend: "vlm"                 # vlm(需GPU,版面精度首选) / pipeline(CPU可降级)
-    device: "cuda"
-  # 方案C 专属配置
+    backend: pipeline
+    device: cuda
   minicpm_v:
-    model_path: "openbmb/MiniCPM-V-4_5"
-    quantization: "awq"
-
+    model_path: openbmb/MiniCPM-V-4_5
+    quantization: awq
 embedding:
-  # 用户可选：A / B
-  provider: "A"                    # A=BGE-M3, B=Qwen3-Embedding
-  # 方案A 专属配置
+  provider: A
   bge_m3:
-    model_name: "BAAI/bge-m3"
+    model_name: BAAI/bge-m3
     use_fp16: true
-  # 方案B 专属配置
   qwen3:
-    model_name: "Qwen/Qwen3-Embedding-0.6B"
+    model_name: Qwen/Qwen3-Embedding-0.6B
     max_length: 8192
-    query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query.\nquery: "
+    query_instruction: 'Instruct: Given a web search query, retrieve relevant passages
+      that answer the query.
 
+      query: '
 storage:
   minio:
-    endpoint: "localhost:9000"
-    access_key: "admin"
-    secret_key_env: "keyring:minio_secret_key"
-    bucket: "knowledge-base"
+    endpoint: localhost:9000
+    access_key: admin
+    bucket: knowledge-base
+    secret_key: keyring:minio_secret_key
   postgres:
-    host: "localhost"
+    host: localhost
     port: 5432
-    database: "knowledge_base"
-    user: "admin"
-    password_env: "keyring:pg_password"
-  # 轻量方案：取消上述 minio/postgres，改用下面两段（见 9.4）
-  # sqlite:
-  #   path: "./data/knowledge_base.db"
-  # local_fs:
-  #   root: "./data/files"
+    database: knowledge_base
+    user: admin
+    password: keyring:pg_password
   qdrant:
-    host: "localhost"
+    host: localhost
     port: 6333
-    collection: "text_chunks"
-
+    collection: text_chunks
 chunking:
   target_tokens: 300
   overlap_ratio: 0.15
   min_chunk_tokens: 50
-
 retrieval:
   top_k_dense: 20
   top_k_sparse: 20
   rrf_k: 60
   final_top_k: 5
-
 concurrency:
   max_gpu_tasks: 1
   llm_rpm: 60
   llm_tpm: 90000
   import_queue_size: 16
-
 ui:
   window_width: 1400
   window_height: 900
-  theme: "dark"
+  theme: dark
