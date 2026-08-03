@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +15,14 @@ class LifecycleService:
     """文档生命周期管理"""
 
     def __init__(self, pg_repo, qdrant_store, minio_repo, compensation,
-                 file_service=None):
+                 file_service=None, factory=None, embedder=None):
         self.pg = pg_repo
         self.qdrant = qdrant_store
         self.minio = minio_repo
         self.compensation = compensation
         self.file_service = file_service
+        self.factory = factory
+        self.embedder = embedder
 
     def delete_document(self, doc_id: int):
         """删除文档：级联清理 PG chunk_index + chunk_category + Qdrant 向量 + MinIO 原始文件。
@@ -54,3 +58,51 @@ class LifecycleService:
         cid_str = f"chunk_{chunk_id}"
         self.qdrant.update_payload(cid_str, {"categories": cats})
         logger.info(f"分类变更已同步 chunk_id={cid_str}")
+
+    # ========== 向量库重建（技术文档 11.3 问题7） ==========
+
+    def rebuild_vector_store(self, new_embedder=None, new_collection_name: Optional[str] = None,
+                             batch_size: int = 100):
+        """触发向量库重建（用户点击'重建向量库'按钮调用）。
+
+        原子性设计：新建 collection → 全量重编码 → 切换 → 删除旧 collection。
+        中途失败时旧 collection 仍可用，新 collection 可清理后重试。
+
+        Args:
+            new_embedder: 新 Embedder 实例（None 时用 factory 按当前配置创建）
+            new_collection_name: 新 collection 名（None 时自动生成带时间戳后缀，
+                                 避免与旧 collection 同名）
+            batch_size: 批量编码/upsert 大小
+
+        Returns:
+            RebuildWorker 实例（已配置，未启动）。调用方连接 progress/finished/error
+            信号后调用 .start()。
+        """
+        from workers.rebuild_worker import RebuildWorker
+        from adapters.qdrant_store import QdrantStore
+
+        # ① 新 embedder 实例
+        embedder = new_embedder
+        if embedder is None:
+            if self.factory is None:
+                raise ValueError("new_embedder 与 factory 不能同时为空")
+            embedder = self.factory.create_embedder()
+
+        # ② 新 qdrant_store 指向新 collection（与旧 collection 隔离）
+        if new_collection_name is None:
+            new_collection_name = f"{self.qdrant.collection}_rebuild_{int(time.time())}"
+
+        new_qdrant = QdrantStore(
+            host=self.qdrant.host, port=self.qdrant.port,
+            collection=new_collection_name,
+            sparse_support=embedder.supports_sparse
+        )
+
+        old_collection = self.qdrant.collection
+        worker = RebuildWorker(
+            pg_repo=self.pg, embedder=embedder, qdrant_store=new_qdrant,
+            old_collection=old_collection, batch_size=batch_size
+        )
+        logger.info(f"向量库重建 worker 已创建: old={old_collection}, "
+                    f"new={new_collection_name}, batch_size={batch_size}")
+        return worker

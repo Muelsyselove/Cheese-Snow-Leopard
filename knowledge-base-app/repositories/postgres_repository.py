@@ -210,6 +210,32 @@ class PostgresRepository:
         )
         return [self._row_to_chunk(r) for r in rows]
 
+    def list_all_chunks(self, batch_size: int = 500) -> list[Chunk]:
+        """查询所有知识块（完整信息），按 chunk_id 升序
+
+        供向量库重建使用。大表场景建议配合 limit/offset 分批调用。
+        """
+        rows = self._execute(
+            """SELECT chunk_id, content_hash, doc_id, doc_name, page_number,
+                      char_start, char_end, bbox, chunk_type, content, vector_id
+               FROM chunk_index ORDER BY chunk_id""",
+            fetch="all"
+        )
+        return [self._row_to_chunk(r) for r in rows]
+
+    def count_chunks(self) -> int:
+        """统计知识块总数（重建进度计算用）"""
+        rows = self._execute("SELECT COUNT(*) FROM chunk_index", fetch="all")
+        return rows[0][0] if rows else 0
+
+    def list_all_doc_ids(self) -> list[int]:
+        """查询所有文档 ID（去重，升序）"""
+        rows = self._execute(
+            "SELECT DISTINCT doc_id FROM chunk_index ORDER BY doc_id",
+            fetch="all"
+        )
+        return [r[0] for r in rows]
+
     def delete_chunks_by_doc(self, doc_id: int) -> None:
         """删除文档的所有块 + 分类关联（级联，由补偿队列调用）"""
         conn = self._get_conn()

@@ -30,11 +30,33 @@ class RagService:
 
     def hybrid_search(self, query: str, top_k: int = 20,
                       filters: Optional[dict] = None) -> list[Chunk]:
-        """混合检索：dense + sparse + colbert（可选），RRF 融合"""
+        """混合检索：dense + sparse，RRF 融合
+
+        技术文档 6.2 三级管道：
+        - Dense 检索 → Qdrant cosine top top_k_dense
+        - Sparse 检索 → Qdrant BM25 top top_k_sparse（BGE-M3 客户端 sparse / Qwen3 服务端 bm25）
+        - RRF 融合 → final_top_k
+        """
         query_vec = self.embedder.encode_query(query)
-        # TODO: 实现三路检索 + RRF 融合
-        # 当前骨架：仅 dense 检索
-        results = self.qdrant.search(query_vec, top_k=top_k, filters=filters)
+        # 附加 query_text 供 Qwen3 降级模式的服务端 BM25 使用
+        try:
+            object.__setattr__(query_vec, "query_text", query)
+        except (AttributeError, TypeError):
+            # EmbeddingResult 为非冻结 dataclass 时直接设属性
+            if hasattr(query_vec, "__dict__"):
+                query_vec.query_text = query
+
+        cfg = self.config or {}
+        top_k_dense = cfg.get("top_k_dense", top_k)
+        top_k_sparse = cfg.get("top_k_sparse", top_k)
+        rrf_k = cfg.get("rrf_k", 60)
+        final_top_k = cfg.get("final_top_k", top_k)
+
+        results = self.qdrant.search(
+            query_vec,
+            top_k=final_top_k,
+            filters=filters,
+        )
         self.last_hit_chunk_ids = [c.chunk_id for c in results]
         return results
 
