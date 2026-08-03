@@ -30,7 +30,6 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     """加载配置文件并解析 keyring 占位符"""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    # 递归解析 keyring:xxx 占位符
     data = _resolve_credentials(data)
     return AppConfig(
         llm=data["llm"],
@@ -93,7 +92,7 @@ class ComponentFactory:
         cfg = self.config.llm
         return OpenAILLMClient(
             api_base=cfg["api_base"],
-            api_key=cfg["api_key"],  # 已由 load_config 解析为真实值
+            api_key=cfg["api_key"],
             model=cfg["model"],
             temperature=cfg.get("temperature", 0.3),
             max_tokens=cfg.get("max_tokens", 4096),
@@ -114,3 +113,17 @@ class ComponentFactory:
         """创建 Snowflake ID 生成器"""
         from services.encoding import SnowflakeGenerator
         return SnowflakeGenerator(worker_id=self.config.encoding.get("worker_id", 1))
+
+    def create_chunker(self, token_counter=None):
+        """创建文档分块器（结构感知分块）
+
+        :param token_counter: 可选的 TokenCounter，默认使用 CharTokenCounter（无第三方依赖）
+        """
+        from services.chunker import StructureAwareChunker
+        cfg = self.config.chunking
+        return StructureAwareChunker(
+            target_tokens=cfg.get("target_tokens", 300),
+            overlap_ratio=cfg.get("overlap_ratio", 0.15),
+            min_chunk_tokens=cfg.get("min_chunk_tokens", 50),
+            token_counter=token_counter,
+        )
