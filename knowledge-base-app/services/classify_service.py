@@ -19,14 +19,15 @@ logger = logging.getLogger(__name__)
 class ClassifyService:
     """AI 分类 + 多归属"""
 
-    def __init__(self, llm: LLMClient, category_repo=None):
+    def __init__(self, llm: LLMClient, category_repo=None, snowflake=None):
         self.llm = llm
         self.category_repo = category_repo
+        self.snowflake = snowflake
 
     def classify(self, chunks: list[Chunk]) -> list[list[ChunkCategory]]:
         """对知识块批量分类，返回每个块的分类关联列表"""
         # 获取所有可选分类
-        categories = self.category_repo.list_all() if self.category_repo else []
+        categories = self.category_repo.list_all_categories() if self.category_repo else []
         if not categories:
             return [[] for _ in chunks]
 

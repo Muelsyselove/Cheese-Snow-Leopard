@@ -41,21 +41,31 @@ class FileService:
         """文档导入全流程。
         失败时保留记录 + 标记 failed + fail_stage，清理操作入 compensation_queue。
         """
+        import os
+        from services.encoding import content_hash as compute_hash
+
         doc_id = self.snowflake.next_id()
 
         # 阶段 1: 上传原始文件 + 写 document_index(parsing)
         file_path_stored = self.minio.upload(file_path)
-        self.pg.insert_document(doc_id, file_path, file_path_stored,
-                                 parse_status="parsing")
+        # 计算文件级 content_hash + 提取元数据
+        file_name = os.path.basename(file_path)
+        file_type = os.path.splitext(file_name)[1].lstrip(".").lower() or "unknown"
+        with open(file_path, "rb") as f:
+            file_hash = compute_hash(f.read().decode("utf-8", errors="replace"))
+        self.pg.insert_document(
+            doc_id, file_name, file_path_stored, file_type, file_hash,
+            parse_status="parsing"
+        )
         try:
             # 阶段 2: 解析 + 分块 + 编码
             parsed = self.parser.parse_document(file_path)
             chunks = self.chunker.split(parsed)
-            from services.encoding import content_hash
             for chunk in chunks:
                 chunk.chunk_id = self.snowflake.next_id()
                 chunk.doc_id = doc_id
-                chunk.content_hash = content_hash(chunk.content)
+                chunk.doc_name = file_name
+                chunk.content_hash = compute_hash(chunk.content)
             self.pg.update_parse_status(doc_id, "embedding")
 
             # 阶段 3: 向量化
