@@ -13,6 +13,7 @@ from services.concurrency import (
 )
 from services.compensation import CompensationReconciler
 from services.chunker import StructureAwareChunker, CharTokenCounter
+from services.rrf_fusion import rrf_fuse, rrf_fuse_with_scores
 
 __all__ = [
     "SnowflakeGenerator", "content_hash",
@@ -22,4 +23,5 @@ __all__ = [
     "GlobalTaskQueue", "GpuSemaphore", "LlmTokenBucket",
     "CompensationReconciler",
     "StructureAwareChunker", "CharTokenCounter",
+    "rrf_fuse", "rrf_fuse_with_scores",
 ]
