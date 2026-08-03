@@ -1,17 +1,13 @@
 @echo off
-chcp 65001 >nul
 setlocal enabledelayedexpansion
-
 REM ============================================================
-REM 自主知识库桌面应用 — Windows 启动脚本
+REM Knowledge Base Desktop App - Windows Launcher
 REM
-REM 功能：
-REM   1. 自动创建/复用 .venv 虚拟环境
-REM   2. 安装依赖（首次或 requirements.txt 变更时）
-REM   3. 启动 PySide6 桌面应用
+REM 1. Create/reuse .venv
+REM 2. Install deps (first run or requirements.txt changed)
+REM 3. Launch PySide6 app
 REM
-REM 用法：
-REM   双击运行 或 在终端执行 start.bat
+REM Usage: double-click or run start.bat in terminal
 REM ============================================================
 
 cd /d "%~dp0"
@@ -22,34 +18,31 @@ set "VENV_PIP=%VENV_DIR%\Scripts\pip.exe"
 set "REQUIREMENTS=requirements.txt"
 set "MARKER=.venv\.installed"
 
-REM ---------- 1. 检查系统 Python ----------
+REM ---------- 1. Check system Python ----------
 where python >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 Python，请先安装 Python 3.10+ 并加入 PATH。
-    echo        下载地址：https://www.python.org/downloads/
+    echo [ERROR] Python not found. Please install Python 3.10+ and add to PATH.
+    echo         https://www.python.org/downloads/
     pause
     exit /b 1
 )
 
-REM ---------- 2. 创建虚拟环境（首次） ----------
+REM ---------- 2. Create venv (first run) ----------
 if not exist "%VENV_PYTHON%" (
-    echo [初始化] 创建虚拟环境 %VENV_DIR% ...
+    echo [INIT] Creating venv %VENV_DIR% ...
     python -m venv %VENV_DIR%
     if errorlevel 1 (
-        echo [错误] 虚拟环境创建失败。
+        echo [ERROR] venv creation failed.
         pause
         exit /b 1
     )
-    echo [初始化] 虚拟环境已创建。
+    echo [INIT] venv created.
 )
 
-REM ---------- 3. 安装依赖（首次或 requirements.txt 变更） ----------
-REM 通过 .installed 标记文件判断是否需要安装；
-REM requirements.txt 变更后删除 .venv\.installed 即可触发重装。
+REM ---------- 3. Install deps (first run or requirements.txt changed) ----------
 set "NEED_INSTALL=0"
 if not exist "%MARKER%" set "NEED_INSTALL=1"
 
-REM 比对修改时间：requirements.txt 比 marker 新则重装
 if exist "%MARKER%" (
     for %%F in ("%REQUIREMENTS%") do set "REQ_TIME=%%~tF"
     for %%F in ("%MARKER%") do set "MRK_TIME=%%~tF"
@@ -57,30 +50,26 @@ if exist "%MARKER%" (
 )
 
 if "!NEED_INSTALL!"=="1" (
-    echo [初始化] 安装依赖（可能需要几分钟，首次较慢）...
+    echo [INIT] Installing deps (may take a few minutes)...
     "%VENV_PYTHON%" -m pip install --upgrade pip
     "%VENV_PIP%" install -r %REQUIREMENTS%
     if errorlevel 1 (
-        echo [错误] 依赖安装失败，请检查网络或 requirements.txt。
+        echo [ERROR] Deps install failed. Check network or requirements.txt.
         pause
         exit /b 1
     )
-    REM 写入安装标记
     echo installed > "%MARKER%"
-    echo [初始化] 依赖安装完成。
+    echo [INIT] Deps installed.
 )
 
-REM ---------- 4. 启动应用 ----------
+REM ---------- 4. Launch app ----------
 echo.
-echo [启动] 自主知识库桌面应用 ...
+echo [START] Knowledge Base Desktop App ...
 echo.
 "%VENV_PYTHON%" main.py
 
-REM 异常退出时暂停以便查看错误
 if errorlevel 1 (
     echo.
-    echo [错误] 应用异常退出（退出码 %errorlevel%）。
+    echo [ERROR] App exited with code %errorlevel%.
     pause
 )
-
-endlocal
