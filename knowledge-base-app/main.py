@@ -38,7 +38,7 @@ def main():
     snowflake = factory.create_snowflake()
     logger.info("组件实例化完成")
 
-    # 2.5 创建存储仓库（PostgresRepository）
+    # 2.5 创建存储仓库（PostgresRepository + 对象存储）
     from repositories import PostgresRepository
     pg_cfg = config.storage.get("postgres", {})
     pg_repo = PostgresRepository(
@@ -48,6 +48,7 @@ def main():
         user=pg_cfg.get("user", "admin"),
         password=pg_cfg.get("password", "")
     )
+    minio_repo = factory.create_object_storage()
     # 溯源服务注入 chunk 仓库
     from services.trace_service import set_chunk_repository
     set_chunk_repository(pg_repo)
@@ -72,10 +73,12 @@ def main():
         llm=llm, category_repo=pg_repo, snowflake=snowflake
     )
     # 补偿 reconciler（注入 pg_repo / qdrant / minio_repo）
-    # minio_repo 暂用占位（待 minio 仓库实现后替换）
     reconciler = CompensationReconciler(
-        pg=pg_repo, qdrant=qdrant, minio=None
+        pg=pg_repo, qdrant=qdrant, minio_repo=minio_repo
     )
+
+    # 创建 chunker（结构感知分块）
+    chunker = factory.create_chunker()
 
     # 5. 启动主窗口
     from ui.main_window import MainWindow
@@ -90,16 +93,21 @@ def main():
     logger.info("补偿队列 reconciler 已启动")
 
     # 7. 扫描 pending/failed 文档恢复执行（后台异步）
-    # TODO: 待 chunker / minio_repo 实现后启用完整恢复流程
-    # def _resume():
-    #     file_service = file_svc.FileService(
-    #         pg=pg_repo, minio=minio_repo, parser=parser,
-    #         chunker=chunker, embedder=embedder, snowflake=snowflake,
-    #         qdrant_store=qdrant, classify_service=classify_service,
-    #         compensation=reconciler
-    #     )
-    #     file_service.resume_interrupted()
-    # threading.Thread(target=_resume, daemon=True).start()
+    # 注：_resume_from_stage 当前为骨架，FileService 装配已就绪，
+    #     待 _resume_from_stage 实现后即可启用完整恢复流程
+    def _resume():
+        try:
+            file_service = file_svc.FileService(
+                parser=parser, embedder=embedder, llm=llm,
+                snowflake=snowflake, chunker=chunker,
+                pg_repo=pg_repo, minio_repo=minio_repo,
+                qdrant_store=qdrant, classify_service=classify_service,
+                compensation=reconciler
+            )
+            file_service.resume_interrupted()
+        except Exception as e:
+            logger.error(f"恢复中断文档失败: {e}")
+    threading.Thread(target=_resume, daemon=True).start()
 
     sys.exit(app.exec())
 
