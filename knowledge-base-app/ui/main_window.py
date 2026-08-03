@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QSplitter, QStatusBar, QFileDialog,
-    QMessageBox
+    QMessageBox, QMenu
 )
+from PySide6.QtGui import QAction
 from PySide6.QtCore import Slot
 
 from ui.chat_panel import ChatPanel
@@ -23,6 +24,8 @@ class MainWindow(QMainWindow):
         self.rag_service = rag_service
         self.lifecycle_service = lifecycle_service
         self.config = config or {}
+        # 持有 worker 引用避免被 GC
+        self._rebuild_worker = None
 
         self.setWindowTitle("自主知识库桌面应用")
         self.resize(
@@ -32,6 +35,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._init_status_bar()
+        self._init_menu()
 
     def _init_ui(self):
         central = QWidget()
@@ -66,6 +70,61 @@ class MainWindow(QMainWindow):
 
     def _init_status_bar(self):
         self.statusBar().showMessage("就绪")
+
+    def _init_menu(self):
+        """初始化菜单栏"""
+        tools_menu = self.menuBar().addMenu("工具(&T)")
+
+        rebuild_action = QAction("重建向量库(&R)", self)
+        rebuild_action.setStatusTip("切换 Embedding 模型后全量重编码知识块")
+        rebuild_action.triggered.connect(self.on_rebuild_vector_store)
+        tools_menu.addAction(rebuild_action)
+
+    @Slot()
+    def on_rebuild_vector_store(self):
+        """用户点击'重建向量库'菜单，触发后台重建流程。"""
+        if not self.lifecycle_service:
+            QMessageBox.warning(self, "提示", "生命周期服务未装配，无法重建")
+            return
+
+        # 二次确认（耗时操作，避免误触）
+        reply = QMessageBox.question(
+            self, "重建向量库",
+            "将全量重编码所有知识块，期间可继续检索旧向量库。\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            worker = self.lifecycle_service.rebuild_vector_store()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"启动重建失败: {e}")
+            return
+
+        self._rebuild_worker = worker
+        worker.progress.connect(self._on_rebuild_progress)
+        worker.finished.connect(self._on_rebuild_finished)
+        worker.error.connect(self._on_rebuild_error)
+        worker.start()
+        self.statusBar().showMessage("向量库重建已启动…")
+
+    @Slot(int, str)
+    def _on_rebuild_progress(self, percent: int, msg: str):
+        self.statusBar().showMessage(f"重建: {msg} ({percent}%)")
+
+    @Slot(bool)
+    def _on_rebuild_finished(self, success: bool):
+        if success:
+            self.statusBar().showMessage("向量库重建完成", 5000)
+            QMessageBox.information(self, "完成", "向量库重建完成")
+        else:
+            self.statusBar().showMessage("向量库重建失败", 5000)
+        self._rebuild_worker = None
+
+    @Slot(str)
+    def _on_rebuild_error(self, msg: str):
+        QMessageBox.critical(self, "重建失败", msg)
 
     def on_import_files(self, paths: list[str]):
         """UI 线程接收文件导入请求，启动 ParseWorker"""

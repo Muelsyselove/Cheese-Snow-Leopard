@@ -62,7 +62,7 @@ def main():
     from services.rag_service import RagService
     from services.classify_service import ClassifyService
     from services.compensation import CompensationReconciler
-    import services.lifecycle_service as lifecycle
+    from services.lifecycle_service import LifecycleService
     import services.file_service as file_svc
 
     rag_service = RagService(
@@ -76,13 +76,21 @@ def main():
     reconciler = CompensationReconciler(
         pg=pg_repo, qdrant=qdrant, minio_repo=minio_repo
     )
+    # 生命周期服务（注入 factory/embedder 供向量库重建使用）
+    lifecycle_service = LifecycleService(
+        pg_repo=pg_repo, qdrant_store=qdrant, minio_repo=minio_repo,
+        compensation=reconciler, factory=factory, embedder=embedder
+    )
 
     # 创建 chunker（结构感知分块）
     chunker = factory.create_chunker()
 
     # 5. 启动主窗口
     from ui.main_window import MainWindow
-    window = MainWindow(rag_service=rag_service, config=config.ui)
+    window = MainWindow(
+        rag_service=rag_service, lifecycle_service=lifecycle_service,
+        config=config.ui
+    )
     window.show()
     logger.info("应用已启动")
 
