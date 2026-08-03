@@ -223,27 +223,34 @@ AI 能力分为两层：
 #### 原始文件目录（document_index 表）
 
 ```sql
--- 文件级正向索引：文件 → 包含哪些知识块
+-- 文件级正向索引：文件元数据。块列表通过 chunk_index.doc_id 反向查询获取，
+-- 不再冗余存储 chunk_ids JSONB（避免双索引不一致）。
 CREATE TABLE document_index (
     doc_id          BIGINT PRIMARY KEY,      -- Snowflake 业务ID
     file_name       VARCHAR(500) NOT NULL,    -- 原始文件名
     file_path       VARCHAR(1000) NOT NULL,   -- 对象存储路径
     file_type       VARCHAR(20) NOT NULL,     -- pdf/docx/png...
     content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 文件指纹
-    chunk_ids       JSONB NOT NULL,           -- 包含的块ID列表（正向索引）
     page_count      INT,
     upload_time     TIMESTAMPTZ DEFAULT now(),
-    parse_status    VARCHAR(20) DEFAULT 'pending'
+    parse_status    VARCHAR(20) DEFAULT 'pending',  -- 见 13.3 状态机
+    fail_stage      VARCHAR(20),              -- 失败时记录阶段: parse/embed/classify/store
+    fail_reason     TEXT                      -- 失败原因，供重启恢复诊断
 );
+
+-- 正向查询（文件→块列表）走此索引
+CREATE INDEX idx_chunk_index_doc_id ON chunk_index(doc_id);
 ```
 
 #### 知识块索引（chunk_index 表）
 
 ```sql
 -- 块级反向索引：知识块 → 来源文件 + 精确位置
+-- chunk_id 在 DB 中为 BIGINT；在 prompt/正则/集合中统一渲染为字符串 "chunk_<snowflake_id>"
+-- （详见 7.1 编码格式约定），DB 查询时用 CAST 或字符串拼接处理。
 CREATE TABLE chunk_index (
     chunk_id        BIGINT PRIMARY KEY,       -- Snowflake 业务ID（系统生成）
-    content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 内容指纹（去重+完整性校验）
+    content_hash    VARCHAR(64) NOT NULL,     -- SHA-256 内容指纹（完整性校验+去重）
     doc_id          BIGINT NOT NULL,          -- 来源文件ID（反向索引）
     doc_name        VARCHAR(500) NOT NULL,    -- 来源文件名（冗余存储便于溯源）
     page_number     INT,                       -- 所在页码
@@ -251,13 +258,17 @@ CREATE TABLE chunk_index (
     char_end        INT,                       -- 字符结束偏移
     bbox            JSONB,                     -- 页面坐标框 [x,y,w,h]
     chunk_type      VARCHAR(20),              -- text/table/image/formula
-    content         TEXT NOT NULL,            -- 块文本内容
+    content         TEXT NOT NULL,            -- 块文本内容（图片块为 VLM 描述文本）
     vector_id       VARCHAR(100),             -- 向量库中的对应ID
-    categories      JSONB DEFAULT '[]',       -- 所属分类列表（多归属）
     created_at      TIMESTAMPTZ DEFAULT now(),
     FOREIGN KEY (doc_id) REFERENCES document_index(doc_id)
 );
+
+-- 去重键：同一文件内相同内容去重，跨文件不去重（保留独立来源）
+CREATE UNIQUE INDEX idx_chunk_dedup ON chunk_index(content_hash, doc_id);
 ```
+
+> **说明**：原 `categories` JSONB 字段已删除。多分类关系统一以 `chunk_category` 关联表为单一数据源，Qdrant payload 在写入时从关联表读取，避免双写不一致（详见 5.3）。
 
 #### 知识库分类目录（category 表 + chunk_category 关联表）
 
@@ -281,18 +292,23 @@ CREATE TABLE chunk_category (
 );
 ```
 
-**关键设计**：`document_index.chunk_ids` 提供正向索引（文件→块），`chunk_index.doc_id` 提供反向索引（块→文件）。这使得"某文件包含哪些知识"和"某知识来自哪个文件的哪一页"两个方向的查询都能高效完成。
+**关键设计**：`chunk_index.doc_id` 提供反向索引（块→文件），并建有 `idx_chunk_index_doc_id` 索引，正向查询（文件→块列表）通过 `SELECT chunk_id FROM chunk_index WHERE doc_id=?` 高效完成。两个方向的查询都走单一数据源，避免冗余字段不一致风险。
 
 ### 4.3 向量存储设计
 
-Qdrant 作为向量索引层，支持以下 Collection 设计：
+Qdrant 作为向量索引层，Collection 设计如下：
 
-| 模态 | Embedding 模型 | 向量类型 | Qdrant Collection |
-|------|---------------|----------|-------------------|
-| 文本块 | BGE-M3（用户可选 Qwen3-Embedding） | dense(1024) + sparse + colbert | `text_chunks` |
-| 图片块 | Qwen3-VL-Embedding-2B | dense(2048) | `image_chunks` |
+| 数据来源 | Embedding 模型 | 向量类型 | Qdrant Collection |
+|----------|---------------|----------|-------------------|
+| 文本块 + 图片块（VLM 描述文本） | BGE-M3（用户可选 Qwen3-Embedding） | dense(1024) + sparse + colbert | `text_chunks` |
 
-检索时分别召回文本块和图片块，RRF 融合后统一排序。若选 Qwen3-Embedding（仅 dense），系统自动降级为"dense + Qdrant 原生 BM25"双路检索，仍保留混合检索能力。
+**统一单 Collection 设计**：图片块不独立向量化，而是用本地 VLM 输出的描述文本走文本 Embedding 入 `text_chunks` collection，通过 payload 的 `chunk_type` 字段区分 `text`/`image`/`table`/`formula`。这样消除了独立的图片 Embedder 依赖（原 `Qwen3-VL-Embedding-2B` 已移除），避免了图文向量空间不一致问题，且图片块同样可被语义检索命中并在溯源时映射回原始图片位置。
+
+**稀疏向量来源约定**（避免向量空间混淆）：
+- **BGE-M3 模式**：sparse 向量由客户端 `BGEM3FlagModel` 计算 `lexical_weights` 后上传，与 dense 同源，向量空间一致。
+- **Qwen3-Embedding 模式**：模型仅输出 dense，sparse 降级为 Qdrant 服务端 `qdrant/bm25` 模型转换。此时 dense 与 sparse 分属不同向量空间，但 Qdrant 会分别建立索引，RRF 融合基于排名而非向量值，不影响检索正确性。
+
+若选 Qwen3-Embedding（仅 dense），系统自动降级为"dense + Qdrant 原生 BM25"双路检索，仍保留混合检索能力。
 
 ---
 
@@ -322,9 +338,10 @@ Qdrant 作为向量索引层，支持以下 Collection 设计：
 
 需求⑤要求"一个知识可属于多个分类"。实现方案为**标签 + 元数据过滤**，块物理存一份，通过 `chunk_category` 多对多关联表实现逻辑多归属：
 
-- `chunk_index.categories` 字段（JSONB）存储分类列表，便于 Qdrant 元数据过滤
-- `chunk_category` 关联表存储完整分类关系，含 AI 分配置信度
-- 检索时可按分类过滤：Qdrant 的 `Filter` + `FieldCondition` 支持按 `categories` 字段筛选
+- `chunk_category` 关联表为**单一数据源**，存储完整分类关系，含 AI 分配置信度
+- Qdrant payload 的 `categories` 字段在写入/更新时从 `chunk_category` 表读取并同步，不作为独立数据源
+- 检索时可按分类过滤：Qdrant 的 `Filter` + `FieldCondition` 支持按 payload 的 `categories` 字段筛选
+- 分类变更时（新增/删除关联）由系统代码同步更新 Qdrant payload，保证两端一致
 
 ---
 
@@ -373,18 +390,24 @@ Qdrant 原生支持稀疏向量（BM25），通过配置 `sparse_vectors` 并设
 
 ### 6.3 Agentic RAG 编排
 
-Agent 编排层使用 LangGraph 的 `StateGraph`，将检索器封装为 Tool，LLM 动态决策是否检索。LangGraph 仅作脚手架，检索逻辑全部自研：
+Agent 编排层使用 LangGraph 的 `StateGraph`，将检索器封装为 Tool，LLM 动态决策是否检索。LangGraph 仅作脚手架，检索逻辑全部自研。
+
+**关键技术决策**：不使用 LangGraph prebuilt `ToolNode`（它只把 tool 结果包成 `ToolMessage` 放回 `messages`，不会更新自定义状态字段）。改为**自定义 tools 节点**，在调用检索后显式写入 `state["retrieved_chunks"]`，确保系统级溯源兜底通道可用。
 
 ```python
 # services/rag_service.py — 自研 Agentic RAG
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 from typing import TypedDict, Annotated, Literal
 from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+
+# retrieved_chunks 用 add 防止多轮检索覆盖
+def _append_list(left: list, right: list) -> list:
+    return (left or []) + (right or [])
 
 class AgentState(TypedDict):
     messages: list
-    retrieved_chunks: list  # 检索结果（系统追踪）
+    retrieved_chunks: Annotated[list[str], _append_list]  # 系统追踪命中 chunk_id（字符串形式）
 
 @tool
 def knowledge_search(query: str) -> str:
@@ -392,17 +415,36 @@ def knowledge_search(query: str) -> str:
     results = rag_service.hybrid_search(query, top_k=20)
     formatted = []
     for chunk in results:
-        formatted.append(f"【{chunk.chunk_id}】{chunk.content}")
+        # chunk_id 统一渲染为 "chunk_<snowflake_id>" 字符串（见 7.1）
+        formatted.append(f"【chunk_{chunk.chunk_id}】{chunk.content}")
     return "\n\n".join(formatted)
 
 def chatbot_node(state: AgentState) -> AgentState:
     system = (
         "你是知识库助手。需要查询知识库时使用 knowledge_search 工具。"
-        "回答时在引用处标注【chunk_id】。"
+        "回答时在引用处标注【chunk_<id>】。"
     )
     messages = [{"role": "system", "content": system}, *state["messages"]]
     response = llm_client.chat(messages, tools=[knowledge_search])
     return {"messages": [response]}
+
+def tools_node(state: AgentState) -> AgentState:
+    """自定义 tools 节点：执行检索并填充 retrieved_chunks（替代 prebuilt ToolNode）"""
+    last_msg = state["messages"][-1]
+    tool_messages = []
+    hit_chunk_ids: list[str] = []
+
+    for call in getattr(last_msg, "tool_calls", []) or []:
+        if call["name"] == "knowledge_search":
+            # 在执行检索时同步记录命中 ID（系统级兜底通道）
+            hits = rag_service.last_hit_chunk_ids  # knowledge_search 内部缓存的命中 ID
+            hit_chunk_ids.extend(f"chunk_{cid}" for cid in hits)
+            result = knowledge_search.invoke(call["args"])
+            tool_messages.append(ToolMessage(
+                content=result, tool_call_id=call["id"], name=call["name"]
+            ))
+
+    return {"messages": tool_messages, "retrieved_chunks": hit_chunk_ids}
 
 def should_continue(state) -> Literal["tools", "end"]:
     last = state["messages"][-1]
@@ -411,7 +453,7 @@ def should_continue(state) -> Literal["tools", "end"]:
 # 组装状态图
 workflow = StateGraph(AgentState)
 workflow.add_node("chatbot", chatbot_node)
-workflow.add_node("tools", ToolNode([knowledge_search]))
+workflow.add_node("tools", tools_node)
 workflow.add_edge(START, "chatbot")
 workflow.add_conditional_edges("chatbot", should_continue,
                                 {"tools": "tools", "end": END})
@@ -419,7 +461,7 @@ workflow.add_edge("tools", "chatbot")
 rag_agent = workflow.compile()
 ```
 
-若 Agent 逻辑简单（仅"判断→检索→生成"循环），可用自研有限状态机替代 LangGraph，进一步减少依赖。
+> **架构决策**：统一采用 LangGraph 作为 Agent 编排脚手架，不再保留"自研有限状态机替代"的备选方案，避免实现分歧。如未来需剥离 LangGraph 依赖，`tools_node` 的状态填充逻辑可直接迁移到自研 FSM。
 
 ---
 
@@ -436,9 +478,23 @@ rag_agent = workflow.compile()
 | Snowflake | 时间戳+机器ID+序列号 | 趋势递增 | 无 | 需分配 workerId | 高（性能最优） |
 | SHA-256 指纹 | 内容加密哈希 | 无 | 天然去重 | 是 | 极高（内容即身份） |
 
-- Snowflake 提供时间排序、分布式生成、数据库索引友好（64 位长整型）
-- SHA-256 提供"内容即身份"的确定性溯源——相同内容必生成相同哈希，重算哈希即可验证块未被篡改
+- Snowflake 提供时间排序、数据库索引友好（64 位长整型），是每个块的**独特编码**（即使两块内容相同，Snowflake ID 也不同）
+- SHA-256 提供"内容即身份"的**内容指纹**——相同内容必生成相同哈希，用于去重（按 `content_hash` 唯一约束）与完整性校验（重算哈希验证块未被篡改）。注意：SHA-256 不是"独特编码"，相同内容共享同一指纹
 - 两者均在分块时由系统代码生成，完全不依赖 AI
+
+**Snowflake workerId 配置**（单机桌面场景）：桌面应用为单机单进程，无需分布式 workerId 协调。在 `config.yaml` 中配置固定 `worker_id`（默认 1），序列号位足够单机使用。若未来支持多实例，可通过本地文件锁分配 workerId。
+
+**编码格式约定（贯穿全系统）**：
+
+| 场景 | chunk_id 表示 | 示例 |
+|------|--------------|------|
+| 数据库存储 | BIGINT | `1751234567890` |
+| Prompt 注入 / AI 输出标注 | 字符串 `chunk_<snowflake_id>` | `chunk_1751234567890` |
+| 正则提取 | `r'【(chunk_\d+)】'` | 匹配 `【chunk_1751234567890】` |
+| `retrieved_chunks` 集合 | 字符串集合 `set[str]` | `{"chunk_1751234567890", ...}` |
+| DB 查询映射 | 字符串去前缀转 BIGINT | `int(cid.removeprefix("chunk_"))` |
+
+此约定确保 AI 输出标注、正则解析、集合校验、DB 查询四个环节格式一致，不会因类型不匹配导致溯源失效。
 
 ### 7.2 系统级溯源四步机制
 
@@ -447,22 +503,24 @@ rag_agent = workflow.compile()
 | 步骤 | 执行者 | 操作 |
 |------|--------|------|
 | ① 检索阶段 | 系统 | 向量+BM25 混合检索，返回 Top-K 块（每个块携带 chunk_id + 元数据） |
-| ② 上下文组装 | 系统 | 将块 ID 与块内容同时注入提示词，指令模型引用时标注 `【chunk_id】` |
-| ③ AI 生成 | AI | AI 输出带引用标记的答案（例：某知识来自 `【chunk_101】`） |
-| ④ 系统后处理 | 系统（非 AI） | 正则解析答案中的块 ID → 查询 chunk_index 表获取来源文件名/页码/坐标 → 校验 ID 是否在检索结果集中（过滤 AI 幻觉 ID）→ 返回结构化引用列表 |
+| ② 上下文组装 | 系统 | 将块 ID 与块内容同时注入提示词，指令模型引用时标注 `【chunk_<id>】` |
+| ③ AI 生成 | AI | AI 输出带引用标记的答案（例：某知识来自 `【chunk_1751234567890】`） |
+| ④ 系统后处理 | 系统（非 AI） | 正则提取答案中的块 ID → **过滤幻觉 ID**（仅保留 `retrieved_chunks` 集合内的）→ 查询 `chunk_index` 表获取来源文件名/页码/坐标 → 返回结构化引用列表 |
+
+> **顺序说明**：第④步先过滤后查询 DB，减少无效 DB 调用；与 7.3 实现代码顺序一致。
 
 **提示词模板示例**：
 
 ```
-请严格根据以下上下文回答问题。每个片段有唯一ID，格式为【chunk_id】。
+请严格根据以下上下文回答问题。每个片段有唯一ID，格式为【chunk_<id>】。
 
 <上下文>
-【chunk_101】知识库采用 Agentic RAG 架构...
-【chunk_102】Qdrant 向量数据库支持元数据过滤...
-【chunk_103】PaddleOCR 中文识别准确率达 96%...
+【chunk_1751234567890】知识库采用 Agentic RAG 架构...
+【chunk_1751234567891】Qdrant 向量数据库支持元数据过滤...
+【chunk_1751234567892】PaddleOCR 中文识别准确率达 96%...
 </上下文>
 
-要求：每个事实后用【chunk_id】注明来源片段ID。
+要求：每个事实后用【chunk_<id>】注明来源片段ID。
 若信息不足以回答，请说明而非编造。
 ```
 
