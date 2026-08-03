@@ -12,6 +12,7 @@ from services.concurrency import (
     GlobalTaskQueue, GpuSemaphore, LlmTokenBucket
 )
 from services.compensation import CompensationReconciler
+from services.chunker import StructureAwareChunker, CharTokenCounter
 
 __all__ = [
     "SnowflakeGenerator", "content_hash",
@@ -20,4 +21,5 @@ __all__ = [
     "LifecycleService",
     "GlobalTaskQueue", "GpuSemaphore", "LlmTokenBucket",
     "CompensationReconciler",
+    "StructureAwareChunker", "CharTokenCounter",
 ]
