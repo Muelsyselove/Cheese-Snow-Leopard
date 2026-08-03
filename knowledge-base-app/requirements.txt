@@ -49,13 +49,11 @@ keyring>=25.0.0
 # 重试
 tenacity>=8.5.0
 
-# ===== 开发依赖（开发时安装：pip install -e ".[dev]"）=====
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-cov>=5.0.0",
-    "pytest-qt>=4.4.0",
-    "testcontainers>=4.7.0",
-    "ruff>=0.6.0",
-    "mypy>=1.11.0",
-]
+# ===== 开发依赖（不在运行时安装，开发时手动 pip install -r requirements-dev.txt）=====
+# 见 requirements-dev.txt：
+#   pytest>=8.0.0
+#   pytest-cov>=5.0.0
+#   pytest-qt>=4.4.0
+#   testcontainers>=4.7.0
+#   ruff>=0.6.0
+#   mypy>=1.11.0
