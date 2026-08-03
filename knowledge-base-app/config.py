@@ -30,6 +30,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     """加载配置文件并解析 keyring 占位符"""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
+    # 递归解析 keyring:xxx 占位符
     data = _resolve_credentials(data)
     return AppConfig(
         llm=data["llm"],
@@ -92,7 +93,7 @@ class ComponentFactory:
         cfg = self.config.llm
         return OpenAILLMClient(
             api_base=cfg["api_base"],
-            api_key=cfg["api_key"],
+            api_key=cfg["api_key"],  # 已由 load_config 解析为真实值
             model=cfg["model"],
             temperature=cfg.get("temperature", 0.3),
             max_tokens=cfg.get("max_tokens", 4096),
@@ -127,3 +128,30 @@ class ComponentFactory:
             min_chunk_tokens=cfg.get("min_chunk_tokens", 50),
             token_counter=token_counter,
         )
+
+    def create_object_storage(self):
+        """创建对象存储仓库
+
+        按配置自动选择后端：
+        - storage.minio 段存在 → MinioRepository（生产方案）
+        - storage.local_fs 段存在 → LocalFSAdapter（轻量方案，技术文档 9.4）
+        两者实现同一 ObjectStorage Protocol，业务层无感切换。
+        """
+        storage = self.config.storage or {}
+        if "minio" in storage:
+            from repositories import MinioRepository
+            cfg = storage["minio"]
+            return MinioRepository(
+                endpoint=cfg.get("endpoint", "localhost:9000"),
+                access_key=cfg.get("access_key", "admin"),
+                secret_key=cfg.get("secret_key", ""),
+                bucket=cfg.get("bucket", "knowledge-base"),
+                secure=cfg.get("secure", False),
+            )
+        if "local_fs" in storage:
+            from repositories import LocalFSAdapter
+            cfg = storage["local_fs"]
+            return LocalFSAdapter(root=cfg.get("root", "./data/files"))
+        # 默认回退到本地文件系统（无外部依赖，开箱即用）
+        from repositories import LocalFSAdapter
+        return LocalFSAdapter(root="./data/files")
