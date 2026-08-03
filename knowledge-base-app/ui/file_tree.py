@@ -1,9 +1,9 @@
-"""文件目录树 — 展示已导入文档"""
+"""文件目录树 — 展示已导入文档（作为文件页主组件）"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton,
-    QFileDialog, QHBoxLayout
+    QFileDialog, QHBoxLayout, QLabel,
 )
 from PySide6.QtCore import Signal
 
@@ -18,17 +18,26 @@ class FileTree(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # 标题
+        title = QLabel("文件管理")
+        title.setStyleSheet("font-weight: bold; font-size: 15px;")
+        layout.addWidget(title)
+
         # 操作按钮
         btn_row = QHBoxLayout()
-        self.import_btn = QPushButton("导入文件")
+        self.import_btn = QPushButton("+ 导入文件")
         self.import_btn.clicked.connect(self._on_import_click)
         btn_row.addWidget(self.import_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
         # 文件树
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["文件名", "状态", "页数"])
-        layout.addWidget(self.tree)
+        self.tree.setColumnWidth(0, 320)
+        layout.addWidget(self.tree, 1)
 
     def _on_import_click(self):
         paths, _ = QFileDialog.getOpenFileNames(

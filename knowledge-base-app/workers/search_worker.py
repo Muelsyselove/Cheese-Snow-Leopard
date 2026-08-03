@@ -13,16 +13,17 @@ class SearchWorker(QThread):
     error = Signal(str)
 
     def __init__(self, rag_service: RagService, question: str,
-                 history: list[dict] = None):
+                 history: list[dict] = None, llm=None):
         super().__init__()
         self.rag = rag_service
         self.question = question
         self.history = history or []
+        self.llm = llm
 
     def run(self):
         try:
             self.progress.emit(10, "正在检索知识库")
-            result = self.rag.query(self.question, self.history)
+            result = self.rag.query(self.question, self.history, llm=self.llm)
             self.progress.emit(100, "检索完成")
             self.finished.emit(result)
         except Exception as e:

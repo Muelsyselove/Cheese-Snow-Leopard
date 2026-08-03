@@ -1,0 +1,32 @@
+# 核心依赖 — 仅包含 UI 启动所需的最小依赖集
+# 安装此清单即可启动桌面界面（部分高级功能不可用，会以警告提示）
+#
+# 完整功能请额外执行: pip install -r requirements.txt
+
+# 桌面 UI（必需）
+PySide6>=6.6.0
+
+# 配置加载（必需）
+PyYAML>=6.0.0
+
+# 凭据安全存储（必需）
+keyring>=25.0.0
+
+# 文字 LLM API（轻量，纯 Python）
+openai>=1.40.0
+
+# 向量库客户端（轻量）
+qdrant-client>=1.10.0
+
+# 元数据存储（二进制 wheel，轻量）
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.0
+
+# 对象存储客户端（轻量）
+minio>=7.2.0
+
+# 重试（轻量）
+tenacity>=8.5.0
+
+# PDF 渲染（有 wheel，中等大小）
+PyMuPDF>=1.24.0

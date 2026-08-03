@@ -3,11 +3,14 @@
 关键技术决策：不使用 LangGraph prebuilt ToolNode（它只把 tool 结果包成 ToolMessage
 放回 messages，不会更新自定义状态字段）。改为自定义 tools 节点，在调用检索后显式
 写入 state["retrieved_chunks"]，确保系统级溯源兜底通道可用。
-"""
-from __future__ import annotations
 
+注意：本文件不使用 `from __future__ import annotations`，因为 LangGraph 的
+StateGraph 在 compile 时会调用 get_type_hints() 解析 TypedDict 注解，
+若注解为字符串（lazy evaluation）则无法在函数局部作用域中解析 Annotated 和
+自定义 reducer 函数，导致 NameError。
+"""
 import logging
-from typing import Optional
+from typing import Optional, Annotated, TypedDict, Literal
 
 from interfaces.embedder import Embedder
 from interfaces.llm import LLMClient
@@ -15,6 +18,58 @@ from interfaces.vectorstore import VectorStore
 from models.chunk import Chunk
 
 logger = logging.getLogger(__name__)
+
+
+def _to_openai_messages(messages: list) -> list[dict]:
+    """将 langchain 消息对象 / 原始 dict 统一转为 OpenAI dict 格式
+
+    OpenAI SDK 无法序列化 langchain 的 HumanMessage/AIMessage/ToolMessage，
+    需在调用前转换为 {"role": ..., "content": ...} 字典。
+    """
+    result = []
+    for m in messages:
+        # 已经是 dict
+        if isinstance(m, dict):
+            result.append(m)
+            continue
+        # langchain 消息对象
+        content = getattr(m, "content", "") or ""
+        tool_calls = getattr(m, "tool_calls", None)
+        # 判断类型
+        cls_name = type(m).__name__
+        if cls_name == "HumanMessage":
+            result.append({"role": "user", "content": content})
+        elif cls_name == "AIMessage":
+            msg = {"role": "assistant", "content": content}
+            # 转换 tool_calls 为 OpenAI 格式
+            if tool_calls:
+                openai_calls = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        openai_calls.append(tc)
+                    else:
+                        openai_calls.append({
+                            "id": getattr(tc, "id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(tc, "name", ""),
+                                "arguments": getattr(tc, "args", ""),
+                            },
+                        })
+                msg["tool_calls"] = openai_calls
+            result.append(msg)
+        elif cls_name == "ToolMessage":
+            result.append({
+                "role": "tool",
+                "content": content,
+                "tool_call_id": getattr(m, "tool_call_id", ""),
+            })
+        elif cls_name == "SystemMessage":
+            result.append({"role": "system", "content": content})
+        else:
+            # 兜底：尝试按 content 输出为 user 消息
+            result.append({"role": "user", "content": content})
+    return result
 
 
 class RagService:
@@ -59,14 +114,17 @@ class RagService:
         self.last_hit_chunk_ids = [c.chunk_id for c in results]
         return results
 
-    def query(self, user_question: str, history: list[dict] = None) -> dict:
+    def query(self, user_question: str, history: list[dict] = None,
+              llm=None) -> dict:
         """Agentic RAG 查询，返回答案 + 命中块 ID 集合（字符串形式）
 
+        Args:
+            llm: 可选的 LLM 客户端覆盖（用于对话页选择不同模型）
         Returns:
             {"answer": str, "retrieved_chunks": set[str]}
         """
+        used_llm = llm or self.llm
         from langgraph.graph import StateGraph, START, END
-        from typing import TypedDict, Annotated, Literal
         from langchain_core.tools import tool
         from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
 
@@ -94,10 +152,12 @@ class RagService:
                 "你是知识库助手。需要查询知识库时使用 knowledge_search 工具。"
                 "回答时在引用处标注【chunk_<id>】。"
             )
-            messages = [{"role": "system", "content": system}, *state["messages"]]
-            response = self.llm.chat(messages, tools=[knowledge_search])
+            # 将 langchain 消息对象转为 OpenAI dict 格式（含 tool_calls / tool_call_id）
+            raw_msgs = [{"role": "system", "content": system}]
+            raw_msgs.extend(_to_openai_messages(state["messages"]))
+            response = used_llm.chat(raw_msgs, tools=[knowledge_search])
             ai_msg = AIMessage(content=response["content"],
-                                tool_calls=response.get("tool_calls"))
+                                tool_calls=response.get("tool_calls") or [])
             return {"messages": [ai_msg]}
 
         def tools_node(state: AgentState) -> AgentState:

@@ -1,24 +1,35 @@
-"""主窗口 — 三栏布局（文件树 + 聊天面板 + 引用面板）"""
+"""主窗口 — 左侧栏按钮切换 + 右侧页面（初始展示对话页）
+
+布局：
++--------+--------------------------+
+| 侧边栏 |  右侧页面（QStackedWidget） |
+| 对话   |  ┌──────────────────────┐ |
+| 文件   |  │  当前页内容           │ |
+| 知识库 |  │                      │ |
+| 设置   |  └──────────────────────┘ |
++--------+--------------------------+
+
+不使用顶部菜单栏（用户要求）。
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QSplitter, QStatusBar, QFileDialog,
-    QMessageBox, QMenu
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
+    QStackedWidget, QMessageBox, QFrame,
 )
-from PySide6.QtGui import QAction
-from PySide6.QtCore import Slot
+from PySide6.QtCore import Slot, Qt
 
 from ui.chat_panel import ChatPanel
-from ui.reference_panel import ReferencePanel
 from ui.file_tree import FileTree
-from ui.category_tree import CategoryTree
+from ui.knowledge_page import KnowledgePage
 
 
 class MainWindow(QMainWindow):
-    """主窗口"""
+    """主窗口 — 侧边栏导航 + 页面切换"""
 
     def __init__(self, file_service=None, rag_service=None,
-                 lifecycle_service=None, config=None):
+                 lifecycle_service=None, config=None,
+                 model_config_service=None, chat_store=None):
         super().__init__()
         self.file_service = file_service
         self.rag_service = rag_service
@@ -26,76 +37,148 @@ class MainWindow(QMainWindow):
         self.config = config or {}
         # 持有 worker 引用避免被 GC
         self._rebuild_worker = None
+        self._parse_worker = None
+
+        # 模型配置服务与对话存储
+        from services.model_config_service import ModelConfigService
+        from services.chat_store import ChatStore
+        self.model_config_service = model_config_service or ModelConfigService()
+        self.chat_store = chat_store or ChatStore()
 
         self.setWindowTitle("自主知识库桌面应用")
         self.resize(
-            self.config.get("window_width", 1400),
-            self.config.get("window_height", 900)
+            self.config.get("window_width", 1200),
+            self.config.get("window_height", 800)
         )
 
         self._init_ui()
         self._init_status_bar()
-        self._init_menu()
+        # 默认显示对话页
+        self._switch_to(0)
 
+    # ------------------------------------------------------------------ UI
     def _init_ui(self):
         central = QWidget()
-        layout = QHBoxLayout(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        splitter = QSplitter()
-        # 左栏：文件目录树 + 知识分类树
+        # ---- 左侧导航栏 ----
+        self._sidebar_buttons: list[QPushButton] = []
+        sidebar = self._build_sidebar()
+        main_layout.addWidget(sidebar)
+
+        # ---- 右侧页面栈 ----
+        self.pages = QStackedWidget()
+        main_layout.addWidget(self.pages, 1)
+
+        # 页面 0：对话
+        self.chat_panel = ChatPanel(
+            rag_service=self.rag_service,
+            model_config_service=self.model_config_service,
+            chat_store=self.chat_store,
+        )
+        self.pages.addWidget(self.chat_panel)
+
+        # 页面 1：文件
         self.file_tree = FileTree()
-        self.category_tree = CategoryTree()
-        left_splitter = QSplitter()
-        left_splitter.setOrientation(0x1)  # Vertical
-        left_splitter.addWidget(self.file_tree)
-        left_splitter.addWidget(self.category_tree)
+        self.file_tree.import_requested.connect(self.on_import_files)
+        self.pages.addWidget(self.file_tree)
 
-        # 中栏：聊天面板
-        self.chat_panel = ChatPanel(rag_service=self.rag_service)
+        # 页面 2：知识库
+        self.knowledge_page = KnowledgePage(
+            lifecycle_service=self.lifecycle_service
+        )
+        self.knowledge_page.rebuild_requested.connect(self._do_rebuild)
+        self.pages.addWidget(self.knowledge_page)
 
-        # 右栏：引用面板
-        self.reference_panel = ReferencePanel()
+        # 页面 3：设置（懒加载，避免启动时即加载对话框资源）
+        self._settings_widget: QWidget | None = None
+        # 占位空 widget，首次切换时实例化 SettingsDialog 内容
+        self._settings_placeholder = QWidget()
+        self.pages.addWidget(self._settings_placeholder)
 
-        splitter.addWidget(left_splitter)
-        splitter.addWidget(self.chat_panel)
-        splitter.addWidget(self.reference_panel)
-        splitter.setSizes([300, 700, 300])
-
-        layout.addWidget(splitter)
-        central.setLayout(layout)
         self.setCentralWidget(central)
 
-        # 信号连接
-        self.chat_panel.references_ready.connect(self._on_references_ready)
+    def _build_sidebar(self) -> QWidget:
+        """构建左侧导航栏"""
+        sidebar = QFrame()
+        sidebar.setFixedWidth(140)
+        sidebar.setStyleSheet(
+            "QFrame { background: #2c3e50; }"
+            "QPushButton {"
+            "  color: #ecf0f1; background: transparent; border: none;"
+            "  text-align: left; padding: 14px 16px;"
+            "  font-size: 14px;"
+            "}"
+            "QPushButton:hover { background: #34495e; }"
+            "QPushButton:checked { background: #1abc9c; color: white; }"
+        )
+        v = QVBoxLayout(sidebar)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        # 应用标题
+        title = QPushButton("📚 知识库")
+        title.setEnabled(False)
+        title.setStyleSheet(
+            "QPushButton { color: #bdc3c7; font-size: 15px; "
+            "font-weight: bold; padding: 18px 16px; }"
+        )
+        v.addWidget(title)
+
+        labels = ["💬 对话", "📁 文件", "🏷️ 知识库", "⚙️ 设置"]
+        for i, text in enumerate(labels):
+            btn = QPushButton(text)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked=False, idx=i: self._switch_to(idx))
+            self._sidebar_buttons.append(btn)
+            v.addWidget(btn)
+
+        v.addStretch()
+        return sidebar
 
     def _init_status_bar(self):
         self.statusBar().showMessage("就绪")
 
-    def _init_menu(self):
-        """初始化菜单栏"""
-        tools_menu = self.menuBar().addMenu("工具(&T)")
+    # ---------------------------------------------------------- 页面切换
+    @Slot(int)
+    def _switch_to(self, index: int):
+        """切换到指定页面"""
+        # 设置页懒加载
+        if index == 3 and self._settings_widget is None:
+            self._load_settings_page()
 
-        rebuild_action = QAction("重建向量库(&R)", self)
-        rebuild_action.setStatusTip("切换 Embedding 模型后全量重编码知识块")
-        rebuild_action.triggered.connect(self.on_rebuild_vector_store)
-        tools_menu.addAction(rebuild_action)
+        self.pages.setCurrentIndex(index)
+        # 同步按钮选中态
+        for i, btn in enumerate(self._sidebar_buttons):
+            btn.setChecked(i == index)
 
+        # 从设置页切回对话页时，刷新模型下拉框（模型配置可能已变更）
+        if index == 0 and self.chat_panel is not None:
+            self.model_config_service.load()
+            self.chat_panel.refresh_models()
+
+    def _load_settings_page(self):
+        """首次切换到设置页时实例化设置界面（嵌入而非对话框）"""
+        from ui.settings_dialog import SettingsPage
+        self._settings_widget = SettingsPage(
+            parent=self, model_config_service=self.model_config_service
+        )
+        self.pages.removeWidget(self._settings_placeholder)
+        self._settings_placeholder.deleteLater()
+        self._settings_placeholder = None
+        self.pages.insertWidget(3, self._settings_widget)
+
+    # ---------------------------------------------------------- 重建向量库
     @Slot()
-    def on_rebuild_vector_store(self):
-        """用户点击'重建向量库'菜单，触发后台重建流程。"""
+    def _do_rebuild(self):
+        """执行向量库重建（由知识库页转发）"""
         if not self.lifecycle_service:
             QMessageBox.warning(self, "提示", "生命周期服务未装配，无法重建")
             return
-
-        # 二次确认（耗时操作，避免误触）
-        reply = QMessageBox.question(
-            self, "重建向量库",
-            "将全量重编码所有知识块，期间可继续检索旧向量库。\n是否继续？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
-
         try:
             worker = self.lifecycle_service.rebuild_vector_store()
         except Exception as e:
@@ -126,16 +209,18 @@ class MainWindow(QMainWindow):
     def _on_rebuild_error(self, msg: str):
         QMessageBox.critical(self, "重建失败", msg)
 
+    # ---------------------------------------------------------- 文件导入
     def on_import_files(self, paths: list[str]):
         """UI 线程接收文件导入请求，启动 ParseWorker"""
         if not self.file_service:
+            QMessageBox.information(self, "提示", "文件服务未就绪")
             return
         from workers.parse_worker import ParseWorker
-        self.worker = ParseWorker(self.file_service.parser, paths)
-        self.worker.progress.connect(self._update_progress)
-        self.worker.finished.connect(self._on_parse_done)
-        self.worker.error.connect(self._show_error)
-        self.worker.start()
+        self._parse_worker = ParseWorker(self.file_service.parser, paths)
+        self._parse_worker.progress.connect(self._update_progress)
+        self._parse_worker.finished.connect(self._on_parse_done)
+        self._parse_worker.error.connect(self._show_error)
+        self._parse_worker.start()
 
     @Slot(int, str)
     def _update_progress(self, percent: int, msg: str):
@@ -151,7 +236,3 @@ class MainWindow(QMainWindow):
     def _show_error(self, msg: str):
         QMessageBox.critical(self, "错误", msg)
         self.statusBar().showMessage("操作失败")
-
-    @Slot(list)
-    def _on_references_ready(self, references):
-        self.reference_panel.show_references(references)

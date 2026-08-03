@@ -186,7 +186,16 @@ class FileService:
 
     def _fetch_original_file(self, doc: Document) -> str:
         """从 MinIO 拉回原始文件到本地临时路径，供重新解析。"""
-        tmp_dir = tempfile.mkdtemp(prefix="resume_")
+        try:
+            from utils.paths import get_tmp_dir
+            base_tmp = get_tmp_dir()
+        except Exception:
+            base_tmp = None
+        if base_tmp:
+            import tempfile as _tf
+            tmp_dir = _tf.mkdtemp(prefix="resume_", dir=base_tmp)
+        else:
+            tmp_dir = tempfile.mkdtemp(prefix="resume_")
         local_path = os.path.join(tmp_dir, doc.file_name)
         self.minio.download(doc.file_path, local_path)
         logger.debug(f"已拉回原始文件 doc_id={doc.doc_id} → {local_path}")
