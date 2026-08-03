@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 class QdrantStore:
     """Qdrant 向量存储实现"""
 
-    # Qdrant 向量名约定
     DENSE_NAME = "dense"
     SPARSE_NAME = "sparse"
 
@@ -35,9 +34,9 @@ class QdrantStore:
         self.host = host
         self.port = port
         self.collection = collection
-        self.sparse_support = sparse_support  # 是否启用稀疏向量（取决于 Embedder）
+        self.sparse_support = sparse_support
         self._client = None
-        self._dim: Optional[int] = None  # 已创建 collection 的 dense 维度
+        self._dim: Optional[int] = None
 
     def _get_client(self):
         if self._client is None:
@@ -54,7 +53,6 @@ class QdrantStore:
         from qdrant_client.models import Distance, VectorParams, SparseVectorParams
         client = self._get_client()
 
-        # 已存在则跳过（维度不一致时重建由 rebuild_worker 负责）
         existing = client.get_collection(self.collection)
         if existing is not None:
             self._dim = dim
@@ -92,22 +90,18 @@ class QdrantStore:
             }
             vector = {self.DENSE_NAME: emb.dense}
             if self.sparse_support and emb.sparse:
-                # Qdrant 要求 sparse 为 SparseVector(indices, values)
                 indices = sorted(emb.sparse.keys())
                 vector[self.SPARSE_NAME] = SparseVector(
                     indices=indices,
                     values=[emb.sparse[i] for i in indices],
                 )
             points.append(PointStruct(
-                id=chunk.chunk_id,  # Qdrant 支持 int id
+                id=chunk.chunk_id,
                 vector=vector,
                 payload=payload
             ))
         client.upsert(collection_name=self.collection, points=points)
 
-    # ------------------------------------------------------------------
-    # 单路检索（供 rag_service 做 RRF 融合）
-    # ------------------------------------------------------------------
     def search_dense(self, query_vec: EmbeddingResult, top_k: int = 20,
                      filters: Optional[dict] = None) -> list[tuple[Chunk, int]]:
         """Dense 向量检索，返回 (chunk, rank) 列表，rank 从 1 开始"""
@@ -132,7 +126,6 @@ class QdrantStore:
         qfilter = self._build_filter(filters) if filters else None
 
         if self.sparse_support and query_vec.sparse:
-            # 客户端 sparse 向量查询（BGE-M3 模式）
             from qdrant_client.models import SparseVector
             indices = sorted(query_vec.sparse.keys())
             sparse_vec = SparseVector(
@@ -146,16 +139,11 @@ class QdrantStore:
                 query_filter=qfilter,
             )
         else:
-            # 服务端 BM25 文本检索（Qwen3 降级模式）
-            # query_vec 不含 sparse，用 query 文本走 qdrant/bm25
-            # 此处 query_text 由调用方通过 query_vec 的附加字段或单独传入
-            # 简化：若 query_vec 无 sparse 且无 query_text，返回空
             query_text = getattr(query_vec, "query_text", None)
             if not query_text:
                 logger.debug("sparse 检索跳过：无 query_text 且无 sparse 向量")
                 return []
             try:
-                from qdrant_client.models import QueryResponse
                 results = client.query_points(
                     collection_name=self.collection,
                     query=query_text,
@@ -177,17 +165,14 @@ class QdrantStore:
         """
         from services.rrf_fusion import rrf_fuse
 
-        # 单路检索（各取 top_k，融合后截断）
         dense_hits = self.search_dense(query_vec, top_k=top_k, filters=filters)
         sparse_hits = []
         if self.sparse_support:
             sparse_hits = self.search_sparse(query_vec, top_k=top_k, filters=filters)
 
         if not sparse_hits:
-            # 无 sparse 路时直接返回 dense 结果
             return [c for c, _ in dense_hits[:top_k]]
 
-        # RRF 融合
         fused = rrf_fuse(dense_hits, sparse_hits, k=60, limit=top_k)
         return fused
 
@@ -228,7 +213,7 @@ class QdrantStore:
         p = point.payload
         return Chunk(
             chunk_id=point.id,
-            content_hash="",  # payload 未存
+            content_hash="",
             doc_id=p.get("doc_id", 0),
             doc_name=p.get("doc_name", ""),
             content=p.get("content", ""),

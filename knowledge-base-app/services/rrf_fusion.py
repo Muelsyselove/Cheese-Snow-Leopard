@@ -46,19 +46,18 @@ def rrf_fuse(*ranked_lists: list[tuple[Chunk, int]],
     if limit <= 0:
         return []
 
-    scores: dict[int, float] = {}   # chunk_id → 融合分数
-    chunks: dict[int, Chunk] = {}   # chunk_id → chunk 实例（保留首次出现）
+    scores: dict[int, float] = {}
+    chunks: dict[int, Chunk] = {}
 
     for ranked in ranked_lists:
         for chunk, rank in ranked:
             if rank < 1:
-                continue  # 非法排名跳过
+                continue
             cid = chunk.chunk_id
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
             if cid not in chunks:
                 chunks[cid] = chunk
 
-    # 按融合分数降序，分数相同则按 chunk_id 升序（稳定排序）
     sorted_ids = sorted(scores.keys(), key=lambda cid: (-scores[cid], cid))
     return [chunks[cid] for cid in sorted_ids[:limit]]
 

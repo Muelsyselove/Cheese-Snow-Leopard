@@ -40,7 +40,6 @@ class CharTokenCounter:
     精度足以用于块大小控制；需精确计数时可注入真实 tokenizer 适配器。
     """
 
-    # CJK 统一表意文字及常见全角字符范围
     _CJK_RANGES = (
         (0x4E00, 0x9FFF),    # CJK 统一表意文字
         (0x3400, 0x4DBF),    # CJK 扩展 A
@@ -69,24 +68,17 @@ class CharTokenCounter:
                 cjk += 1
             else:
                 other += 1
-        # 非 CJK 每 4 字符约 1 token，向上取整
         return cjk + (other + 3) // 4
 
 
-# ---------------------------------------------------------------------------
-# 内部数据结构
-# ---------------------------------------------------------------------------
 @dataclass
 class _Span:
     """文本片段，记录在源块 content 中的字符偏移"""
     text: str
-    start: int   # 相对源块 content 的起始偏移
-    end: int     # 相对源块 content 的结束偏移（ exclusive）
+    start: int
+    end: int
 
 
-# ---------------------------------------------------------------------------
-# 结构感知分块器
-# ---------------------------------------------------------------------------
 class StructureAwareChunker(Chunker):
     """结构感知分块器
 
@@ -96,9 +88,7 @@ class StructureAwareChunker(Chunker):
     - min_chunk_tokens: 最小块 token 数，尾块不足则合并（默认 50）
     """
 
-    # Markdown 标题行正则（# ~ ######）
     _HEADING_RE = re.compile(r"^(#{1,6})\s+\S")
-    # 句子分隔符（中英文句末标点 + 换行）
     _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?\.])\s+")
 
     def __init__(self, target_tokens: int = 300, overlap_ratio: float = 0.15,
@@ -120,36 +110,25 @@ class StructureAwareChunker(Chunker):
         self.overlap_tokens = int(target_tokens * overlap_ratio)
         self.counter = token_counter or CharTokenCounter()
 
-    # ---------------- 公共入口 ----------------
     def split(self, parsed: ParsedDocument) -> list[Chunk]:
-        """将 ParsedDocument 切分为目标 token 数的 Chunk 列表。
-
-        - text 块：结构感知切分
-        - image / table / formula 块：原样保留
-        """
         result: list[Chunk] = []
         for src in parsed.chunks:
             if src.chunk_type == "text":
                 result.extend(self._split_text_block(src))
             else:
-                # 图片/表格/公式块原样保留，不参与切分
                 result.append(self._clone_block(src))
         return result
 
-    # ---------------- 文本块切分 ----------------
     def _split_text_block(self, src: Chunk) -> list[Chunk]:
-        """对单个文本块执行结构感知切分"""
         text = src.content
         if not text or not text.strip():
             return []
 
-        # 是否含 Markdown 标题行（标题为硬语义边界，即便总长未超 target 也按节切分）
         has_heading = any(
             self._HEADING_RE.match(line.strip())
             for line in text.split("\n")
         )
 
-        # 无标题且单块未超目标，直接返回（克隆并保留元数据）
         if not has_heading and self.counter.count(text) <= self.target_tokens:
             return [self._clone_block(src)]
 
@@ -157,32 +136,20 @@ class StructureAwareChunker(Chunker):
         if not spans:
             return []
 
-        # 累积切块
-        chunks = self._accumulate(spans, src)
-        return chunks
+        return self._accumulate(spans, src)
 
     def _split_into_spans(self, text: str) -> list[_Span]:
-        """将文本按段落/标题边界分割为 span 列表，保留字符偏移。
-
-        - 空行分隔段落
-        - Markdown 标题行作为独立 span（硬分节边界）
-        - 单段落过长时按句子进一步切分
-        """
         spans: list[_Span] = []
-        # 按行遍历，累积段落
         para_start: Optional[int] = None
         para_lines: list[str] = []
 
         def flush_para(end_idx: int):
-            """把当前累积的段落输出为 span"""
             nonlocal para_start, para_lines
             if para_start is None or not para_lines:
                 para_start = None
                 para_lines = []
                 return
-            # 段落文本（含内部换行，保留结构）
             joined = "\n".join(para_lines)
-            # 去掉尾部空行产生的多余换行
             joined = joined.rstrip()
             if joined:
                 spans.append(_Span(text=joined, start=para_start, end=end_idx))
@@ -197,10 +164,8 @@ class StructureAwareChunker(Chunker):
             line_end = idx + len(line)
 
             if not stripped:
-                # 空行 → 段落边界
                 flush_para(idx)
             elif self._HEADING_RE.match(stripped):
-                # 标题行 → 先结束当前段落，标题独立成 span
                 flush_para(idx)
                 spans.append(_Span(text=line, start=idx, end=line_end))
             else:
@@ -208,12 +173,10 @@ class StructureAwareChunker(Chunker):
                     para_start = idx
                 para_lines.append(line)
 
-            # 推进到下一行起点（+1 为换行符）
             idx = line_end + 1
 
         flush_para(idx)
 
-        # 过长 span 按句子切分
         refined: list[_Span] = []
         for sp in spans:
             if self.counter.count(sp.text) <= self.target_tokens:
@@ -223,8 +186,6 @@ class StructureAwareChunker(Chunker):
         return refined
 
     def _split_long_span(self, span: _Span) -> list[_Span]:
-        """过长 span 按句子切分；句子仍超长按字符硬切（兜底）"""
-        # 按句子分割，保留每句在 span 内的偏移
         sentences: list[_Span] = []
         pos = 0
         text = span.text
@@ -239,7 +200,6 @@ class StructureAwareChunker(Chunker):
                     end=span.start + end,
                 ))
             last = end
-        # 尾部剩余
         if last < len(text):
             tail = text[last:].strip()
             if tail:
@@ -252,7 +212,6 @@ class StructureAwareChunker(Chunker):
         if not sentences:
             return [span]
 
-        # 句子仍超长 → 按字符硬切
         result: list[_Span] = []
         for sent in sentences:
             if self.counter.count(sent.text) <= self.target_tokens:
@@ -262,10 +221,8 @@ class StructureAwareChunker(Chunker):
         return result
 
     def _hard_split_by_chars(self, span: _Span) -> list[_Span]:
-        """字符级硬切（兜底）：按 token 数近似估算字符步长切分"""
         text = span.text
         total = len(text)
-        # 估算每 target_tokens 对应的字符数
         sample_tokens = self.counter.count(text)
         if sample_tokens <= 0:
             return [span]
@@ -280,17 +237,13 @@ class StructureAwareChunker(Chunker):
             s = e
         return result
 
-    # ---------------- 累积切块 + overlap + 尾块合并 ----------------
     def _accumulate(self, spans: list[_Span], src: Chunk) -> list[Chunk]:
-        """累积 span 到目标 token 数，处理 overlap 与尾块合并"""
         result: list[Chunk] = []
         current_spans: list[_Span] = []
         current_tokens = 0
-        prev_block_text: Optional[str] = None  # 上一块的文本，用于取 overlap
+        prev_block_text: Optional[str] = None
 
         def make_chunk(spans_list: list[_Span]) -> Chunk:
-            # 相邻 span 在源文本中连续（end==start）时无缝拼接，
-            # 否则用换行分隔（保留段落/标题边界结构）
             parts: list[str] = []
             for i, s in enumerate(spans_list):
                 if i == 0:
@@ -302,8 +255,8 @@ class StructureAwareChunker(Chunker):
                     parts.append(s.text)
             content = "".join(parts)
             return Chunk(
-                chunk_id=0,              # 占位，file_service 注入
-                content_hash="",         # 占位，file_service 注入
+                chunk_id=0,
+                content_hash="",
                 doc_id=src.doc_id,
                 doc_name=src.doc_name,
                 content=content,
@@ -324,35 +277,28 @@ class StructureAwareChunker(Chunker):
 
         for sp in spans:
             sp_tokens = self.counter.count(sp.text)
-
-            # 标题行是硬边界：遇到标题先切出当前块
             is_heading = bool(self._HEADING_RE.match(sp.text.strip()))
 
             if current_spans and (
                 is_heading
                 or current_tokens + sp_tokens > self.target_tokens
             ):
-                # 当前块已满或遇到硬边界 → 切出
                 emit()
                 current_spans = []
                 current_tokens = 0
 
-                # overlap：从前块尾部取一段作为新块开头
                 if prev_block_text and self.overlap_tokens > 0:
                     ov_span = self._take_overlap_span(prev_block_text, src)
                     if ov_span is not None:
                         current_spans.append(ov_span)
                         current_tokens = self.counter.count(ov_span.text)
 
-            # 加入当前块
             current_spans.append(sp)
             current_tokens += sp_tokens
 
-        # 尾块处理
         if current_spans:
             if (current_tokens < self.min_chunk_tokens
                     and result and prev_block_text is not None):
-                # 尾块过小 → 合并到前一块（连续切片无缝拼接）
                 last = result[-1]
                 tail_parts: list[str] = []
                 for i, s in enumerate(current_spans):
@@ -364,7 +310,6 @@ class StructureAwareChunker(Chunker):
                         tail_parts.append(sep)
                         tail_parts.append(s.text)
                 tail_text = "".join(tail_parts)
-                # 尾块开头与前块末尾连续则无缝，否则换行
                 sep = "" if (current_spans[0].start == last.char_end) else "\n"
                 last.content = last.content + sep + tail_text
                 last.char_end = current_spans[-1].end
@@ -374,30 +319,21 @@ class StructureAwareChunker(Chunker):
         return result
 
     def _take_overlap_span(self, prev_text: str, src: Chunk) -> Optional[_Span]:
-        """从前一块文本尾部取约 overlap_tokens 数量的内容，在句子边界尽量对齐。
-
-        严格限制 overlap 不超过前块长度（避免整块重复）。
-        返回 span.start/end 为相对源块 content 的偏移。
-        """
         if self.overlap_tokens <= 0 or not prev_text:
             return None
 
-        # 估算 overlap 对应的字符数
         total_tokens = self.counter.count(prev_text)
         if total_tokens <= 0:
             return None
         chars_per_token = len(prev_text) / total_tokens
         target_chars = int(self.overlap_tokens * chars_per_token)
 
-        # overlap 不应超过前块长度的一半（避免整块重复）
         max_chars = len(prev_text) // 2
         if target_chars <= 0 or max_chars <= 0:
             return None
         target_chars = min(target_chars, max_chars)
 
-        # 从尾部向前定位起点
         start_char = len(prev_text) - target_chars
-        # 在起点附近向后找句子结束符，对齐到句子边界（避免截断句子）
         align_start = start_char
         search_end = min(start_char + 20, len(prev_text))
         for i in range(start_char, search_end):
@@ -409,7 +345,6 @@ class StructureAwareChunker(Chunker):
         if not overlap_text:
             return None
 
-        # 映射回源块偏移
         base = src.content.find(prev_text)
         if base >= 0:
             abs_start = base + align_start
@@ -420,10 +355,8 @@ class StructureAwareChunker(Chunker):
 
         return _Span(text=overlap_text, start=abs_start, end=abs_end)
 
-    # ---------------- 辅助 ----------------
     @staticmethod
     def _clone_block(src: Chunk) -> Chunk:
-        """克隆非文本块（image/table/formula），原样保留"""
         return Chunk(
             chunk_id=src.chunk_id,
             content_hash=src.content_hash,

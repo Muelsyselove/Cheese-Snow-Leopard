@@ -22,7 +22,7 @@ knowledge-base-app/
 │   ├── minicpm_vlm.py      # VLM 方案C：MiniCPM-V 4.5（需 GPU）
 │   ├── bge_embedder.py     # Embedding 方案A：BGE-M3（三模态）
 │   ├── qwen3_embedder.py   # Embedding 方案B：Qwen3-Embedding（纯 dense）
-│   ├── qdrant_store.py     # Qdrant 向量存储实现
+│   ├── qdrant_store.py     # Qdrant 向量存储实现（混合检索 + RRF 融合）
 │   └── openai_llm.py       # OpenAI 兼容 LLM 实现
 ├── services/               # 业务逻辑层（自研核心）
 │   ├── file_service.py     # 文件导入全流程编排

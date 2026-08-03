@@ -42,7 +42,6 @@ class RagService:
         try:
             object.__setattr__(query_vec, "query_text", query)
         except (AttributeError, TypeError):
-            # EmbeddingResult 为非冻结 dataclass 时直接设属性
             if hasattr(query_vec, "__dict__"):
                 query_vec.query_text = query
 
