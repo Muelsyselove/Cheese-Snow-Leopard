@@ -8,6 +8,7 @@ from interfaces.embedder import Embedder, EmbeddingResult
 from interfaces.vectorstore import VectorStore
 from interfaces.llm import LLMClient
 from interfaces.chunker import Chunker, TokenCounter
+from interfaces.storage import ObjectStorage
 
 __all__ = [
     "DocumentParser",
@@ -19,4 +20,5 @@ __all__ = [
     "LLMClient",
     "Chunker",
     "TokenCounter",
+    "ObjectStorage",
 ]
