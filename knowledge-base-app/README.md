@@ -80,14 +80,72 @@ knowledge-base-app/
 
 ## 运行
 
+### 一键启动（推荐）
+
+启动脚本自动完成：Python 版本校验 → 创建 .venv → 安装依赖（镜像回退）→ 启动应用。
+
+**Windows**
+```cmd
+start.bat
+```
+
+**Linux / macOS**
 ```bash
-# 安装依赖
-pip install -r requirements.txt
+chmod +x start.sh && ./start.sh
+```
 
-# 配置 keyring 凭据（首次）
+首次运行会交互询问安装模式：
+
+| 模式 | 体积 | 说明 |
+|------|------|------|
+| `core` | ~100MB | 仅 UI + 轻量依赖（PySide6/openai/qdrant-client 等），1-2 分钟 |
+| `full` | ~2GB | 含 paddlepaddle/torch/FlagEmbedding，支持 VLM 解析 + BGE 向量化，5-15 分钟 |
+
+选定模式后会被记录到 `.venv/.install_mode`，后续启动直接沿用、不再询问。
+
+### 命令行参数
+
+```cmd
+start.bat --core       强制仅装核心依赖（快速）
+start.bat --full       强制装完整依赖（含 ML 包）
+start.bat --reinstall  强制重装当前模式依赖
+start.bat --help       显示帮助
+```
+
+```bash
+./start.sh --core
+./start.sh --full
+./start.sh --reinstall
+./start.sh --help
+```
+
+### 镜像回退
+
+依赖安装依次尝试：清华 → 阿里云 → 官方 PyPI，任一成功即停止。requirements 文件更新或模式切换时自动重装（增量检测）。
+
+### 外部服务（需自备）
+
+core/full 仅安装 Python 依赖，以下服务需自行启动：
+
+- **Qdrant**（向量库）：`config.yaml` 中 `storage.qdrant`
+- **PostgreSQL**（元数据）：`config.yaml` 中 `storage.postgres`
+- **MinIO**（对象存储，可选）：未配置时自动回退 `LocalFSAdapter`
+
+### 配置凭据（首次）
+
+API Key 等走系统 keyring，`config.yaml` 仅留 `keyring:xxx` 占位符：
+
+```bash
 python -c "from utils.credentials import set_credential; set_credential('llm_api_key', 'sk-xxx')"
+```
 
-# 启动应用
+### 手动启动（不用脚本）
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # Linux/macOS
+pip install -r requirements.txt
 python main.py
 ```
 
