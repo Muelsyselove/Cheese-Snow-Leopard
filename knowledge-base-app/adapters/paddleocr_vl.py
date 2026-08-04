@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -42,6 +43,10 @@ class PaddleOCRVLModel:
         - 表格块（```...``` 或 |...|）整体保留，chunk_type="table"
         - 其余按段落（空行分隔）切分，chunk_type="text"
         """
+        # markdown / 纯文本文件无需 OCR,直接读取走结构感知分块
+        if _is_text_file(file_path):
+            return _parse_text_file(file_path, parser_name="paddleocr_vl")
+
         model = self._get_model()
         result = model.predict(file_path)
 
@@ -109,6 +114,45 @@ class PaddleOCRVLModel:
                 if isinstance(val, int) and val > 0:
                     return val
         return None
+
+
+# ==================================================================
+# 纯文本 / Markdown 文件直读(绕过 VLM/OCR)
+# ==================================================================
+
+# 无需 VLM 解析的文本类文件后缀
+_TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".text"}
+
+
+def _is_text_file(file_path: str) -> bool:
+    """判断是否为纯文本/markdown 文件(无需 VLM 解析)。"""
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _TEXT_SUFFIXES
+
+
+def _parse_text_file(file_path: str, parser_name: str = "text") -> ParsedDocument:
+    """直接读取文本/markdown 文件内容,走结构感知分块。
+
+    markdown 文件本身就是 parser 的目标格式,无需 OCR/VLM 转换;
+    纯文本(.txt)也按 markdown 段落规则分块(无标题则整体为单段)。
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        # 非 UTF-8 文本,尝试系统默认编码
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+    chunks = _markdown_to_chunks(content)
+    logger.info(
+        f"{parser_name} 直读文本完成 file={file_path} chunks={len(chunks)}"
+    )
+    return ParsedDocument(
+        chunks=chunks, images=[],
+        metadata={"parser": parser_name, "file": file_path,
+                  "direct_read": True, "char_count": len(content)}
+    )
 
 
 # ==================================================================

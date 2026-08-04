@@ -39,15 +39,35 @@ class FileService:
         self.classify = classify_service
         self.compensation = compensation
 
-    def import_document(self, file_path: str) -> int:
+    def list_documents(self) -> list[Document]:
+        """返回全部已导入文档（用于启动时恢复文件树）"""
+        try:
+            return self.pg.list_all_documents()
+        except Exception as e:
+            logger.error(f"查询文档列表失败: {e}")
+            return []
+
+    def import_document(self, file_path: str, progress_cb=None) -> int:
         """文档导入全流程。
         失败时保留记录 + 标记 failed + fail_stage，清理操作入 compensation_queue。
+
+        Args:
+            file_path: 待导入文件路径
+            progress_cb: 可选进度回调 callable(percent, message)，用于上报阶段进度
         """
         from services.encoding import content_hash as compute_hash
+
+        def _report(percent: int, msg: str):
+            if progress_cb is not None:
+                try:
+                    progress_cb(percent, msg)
+                except Exception:
+                    pass
 
         doc_id = self.snowflake.next_id()
 
         # 阶段 1: 上传原始文件 + 写 document_index(parsing)
+        _report(5, "上传文件")
         file_path_stored = self.minio.upload(file_path)
         # 计算文件级 content_hash + 提取元数据
         file_name = os.path.basename(file_path)
@@ -60,6 +80,7 @@ class FileService:
         )
         try:
             # 阶段 2: 解析 + 分块 + 编码
+            _report(15, "解析文档")
             parsed = self.parser.parse_document(file_path)
             chunks = self.chunker.split(parsed)
             for chunk in chunks:
@@ -70,14 +91,17 @@ class FileService:
             self.pg.update_parse_status(doc_id, "embedding")
 
             # 阶段 3: 向量化
+            _report(45, "向量化")
             embeddings = self.embedder.encode([c.content for c in chunks])
             self.pg.update_parse_status(doc_id, "classifying")
 
             # 阶段 4: LLM 分类
+            _report(70, "AI 分类")
             classifications = self.classify.classify(chunks)
             self.pg.update_parse_status(doc_id, "storing")
 
             # 阶段 5: 写 chunk_index + chunk_category
+            _report(85, "写入存储")
             self.pg.insert_chunks(chunks, classifications)
 
             # 阶段 6: 写 Qdrant（最后一步，失败时入补偿队列）
@@ -90,6 +114,7 @@ class FileService:
                 raise StorageError(f"Qdrant 写入失败，已入补偿队列: {qe}") from qe
 
             # 阶段 7: 完成
+            _report(100, "完成")
             self.pg.update_parse_status(doc_id, "completed")
             logger.info(f"文档导入成功 doc_id={doc_id}")
             return doc_id

@@ -53,8 +53,9 @@ class QdrantStore:
         from qdrant_client.models import Distance, VectorParams, SparseVectorParams
         client = self._get_client()
 
-        existing = client.get_collection(self.collection)
-        if existing is not None:
+        # 检查 collection 是否已存在(get_collection 在不存在时抛 404,需先列表检查)
+        existing_collections = [c.name for c in client.get_collections().collections]
+        if self.collection in existing_collections:
             self._dim = dim
             return
 

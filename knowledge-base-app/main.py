@@ -219,6 +219,15 @@ def main():
                 logger.error(f"恢复中断文档失败: {e}")
         threading.Thread(target=_resume, daemon=True).start()
 
+    # 8. 后台预加载向量模型（避免首次导入时才下载/加载模型导致卡顿）
+    if embedder is not None and hasattr(embedder, "preload"):
+        def _preload_embedder():
+            try:
+                embedder.preload()
+            except Exception as e:
+                logger.error(f"向量模型预加载失败: {e}", exc_info=True)
+        threading.Thread(target=_preload_embedder, daemon=True).start()
+
     sys.exit(app.exec())
 
 

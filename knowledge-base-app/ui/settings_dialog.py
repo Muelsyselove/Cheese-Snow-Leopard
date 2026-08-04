@@ -529,62 +529,97 @@ class SettingsPage(QWidget):
         return group
 
     def _on_auto_setup_credentials(self):
-        """一键自动配置：生成 PG/MinIO 密码 + 写 keyring + 更新 config.yaml + 同步模型"""
+        """一键完成配置：从零开始自动发现并启动 PG/Qdrant/MinIO、生成凭据、
+        初始化数据库表结构、回写 config.yaml，直到应用完全可用。
+
+        调用 scripts.bootstrap.Bootstrap.run() 完成全部流程，
+        通过后台线程执行避免阻塞 UI，实时显示日志。
+        """
         reply = QMessageBox.question(
-            self, "确认",
-            "将自动生成随机密码并覆盖现有 PG / MinIO 凭据，\n"
-            "同时同步模型配置到 config.yaml，确认？",
+            self, "确认一键完成配置",
+            "将自动执行完整部署流程：\n"
+            "  - 发现并启动 PostgreSQL / Qdrant / MinIO（未安装的自动下载）\n"
+            "  - 生成随机密码并写入 keyring\n"
+            "  - 创建数据库用户 / 库 / 表结构\n"
+            "  - 回写 config.yaml 引用\n"
+            "  - 同步模型默认配置\n\n"
+            "过程可能需要 1-3 分钟（首次启动 MinIO 需下载），\n"
+            "期间请勿关闭应用。确认继续？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
-        try:
-            import yaml
-            # 1. 生成并写入 keyring
-            pg_pwd = self._gen_password(20)
-            minio_secret = self._gen_password(32)
-            set_credential("pg_password", pg_pwd)
-            set_credential("minio_secret_key", minio_secret)
 
-            # 2. 更新 config.yaml
-            if self._config is None:
-                self._config = {}
-            storage = self._config.setdefault("storage", {})
-            pg = storage.setdefault("postgres", {})
-            pg["password"] = "keyring:pg_password"
-            # 清理旧字段，避免 password_env 残留导致歧义
-            pg.pop("password_env", None)
-            minio = storage.setdefault("minio", {})
-            minio["secret_key"] = "keyring:minio_secret_key"
-            minio.pop("secret_key_env", None)
+        # 防止重复触发
+        if hasattr(self, "_bootstrap_thread") and self._bootstrap_thread and \
+                self._bootstrap_thread.isRunning():
+            QMessageBox.information(self, "提示", "已有部署任务在执行中，请等待完成。")
+            return
 
-            # 3. 同步默认模型到 config.yaml（llm 段）
-            self._model_svc.sync_default_to_config(self._config_path)
-            # 重新加载 config 以获取最新 llm 段
-            try:
-                with open(self._config_path, "r", encoding="utf-8") as f:
-                    self._config = yaml.safe_load(f) or {}
-            except Exception:
-                pass
+        # 构建进度对话框
+        self._bootstrap_dialog = QDialog(self)
+        self._bootstrap_dialog.setWindowTitle("一键部署进度")
+        self._bootstrap_dialog.resize(720, 520)
+        dlg_v = QVBoxLayout(self._bootstrap_dialog)
+        dlg_v.addWidget(QLabel("实时日志："))
+        self._bootstrap_log = QPlainTextEdit()
+        self._bootstrap_log.setReadOnly(True)
+        self._bootstrap_log.setMinimumHeight(380)
+        dlg_v.addWidget(self._bootstrap_log, 1)
+        self._bootstrap_status_lbl = QLabel("进行中 ...")
+        self._bootstrap_status_lbl.setStyleSheet("color: #2a6; font-weight: bold;")
+        dlg_v.addWidget(self._bootstrap_status_lbl)
+        self._bootstrap_close_btn = QPushButton("关闭")
+        self._bootstrap_close_btn.setEnabled(False)
+        self._bootstrap_close_btn.clicked.connect(self._bootstrap_dialog.accept)
+        dlg_v.addWidget(self._bootstrap_close_btn)
 
-            # 4. 写盘
-            with open(self._config_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(self._config, f, allow_unicode=True, sort_keys=False)
+        # 后台线程执行 bootstrap
+        from scripts.bootstrap import Bootstrap
+        self._bootstrap_thread = QThread()
+        self._bootstrap_worker = _BootstrapWorker(Bootstrap, self._config_path)
+        self._bootstrap_worker.moveToThread(self._bootstrap_thread)
+        self._bootstrap_thread.started.connect(self._bootstrap_worker.run)
+        self._bootstrap_worker.progress.connect(self._on_bootstrap_progress)
+        self._bootstrap_worker.finished.connect(self._on_bootstrap_finished)
+        self._bootstrap_thread.start()
 
-            self._refresh_credential_status()
-            QMessageBox.information(
-                self, "完成",
-                "一键配置完成：\n"
-                "- PostgreSQL 密码已生成并写入 keyring\n"
-                "- MinIO Secret Key 已生成并写入 keyring\n"
-                "- config.yaml 已更新引用\n"
-                "- 模型默认配置已同步\n\n"
-                "请确保本地 PostgreSQL / MinIO 服务使用相同密码。\n"
-                "重启应用后生效。"
+        # 模态显示进度对话框（不阻塞后台线程，因为 worker 在另一个线程）
+        self._bootstrap_dialog.exec()
+
+    def _on_bootstrap_progress(self, line: str):
+        if hasattr(self, "_bootstrap_log") and self._bootstrap_log:
+            self._bootstrap_log.appendPlainText(line)
+
+    def _on_bootstrap_finished(self, ok: bool, summary: str):
+        if hasattr(self, "_bootstrap_thread") and self._bootstrap_thread:
+            self._bootstrap_thread.quit()
+            self._bootstrap_thread.wait(3000)
+        if hasattr(self, "_bootstrap_log") and self._bootstrap_log:
+            self._bootstrap_log.appendPlainText("")
+            self._bootstrap_log.appendPlainText("=" * 50)
+            self._bootstrap_log.appendPlainText(summary)
+        if hasattr(self, "_bootstrap_status_lbl") and self._bootstrap_status_lbl:
+            self._bootstrap_status_lbl.setText("完成" if ok else "部分失败")
+            self._bootstrap_status_lbl.setStyleSheet(
+                "color: #2a6; font-weight: bold;" if ok
+                else "color: #c63; font-weight: bold;"
             )
-        except Exception as e:
-            logger.error(f"一键配置失败: {e}", exc_info=True)
-            QMessageBox.critical(self, "失败", f"自动配置失败: {e}")
+        if hasattr(self, "_bootstrap_close_btn") and self._bootstrap_close_btn:
+            self._bootstrap_close_btn.setEnabled(True)
+
+        # 刷新凭据/依赖状态，并重新加载 config（bootstrap 已写盘）
+        self._load_config()
+        self._refresh_credential_status()
+        self._refresh_dependency_status()
+
+        title = "部署完成" if ok else "部署完成（部分失败）"
+        icon = QMessageBox.Information if ok else QMessageBox.Warning
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(icon)
+        box.setText(summary + "\n\n详见上方日志。应用已可直接使用，无需重启。")
+        box.exec()
 
     @staticmethod
     def _gen_password(length: int) -> str:
@@ -830,6 +865,71 @@ class _DataMigrateWorker(QObject):
         from utils.paths import migrate_data_root
         ok, msg = migrate_data_root(self.new_root)
         self.finished.emit(ok, msg)
+
+
+# ============================================================
+# 一键部署 Bootstrap Worker — 后台执行 bootstrap.run() 并转发日志
+# ============================================================
+class _SignalLogHandler(logging.Handler):
+    """将 logging 记录通过 Qt Signal 转发到主线程"""
+
+    def __init__(self, signal):
+        super().__init__()
+        self._signal = signal
+
+    def emit(self, record):  # noqa: A003 - logging.Handler API
+        try:
+            self._signal.emit(self.format(record))
+        except Exception:
+            pass
+
+
+class _BootstrapWorker(QObject):
+    """后台执行 bootstrap.Bootstrap.run()，实时转发日志"""
+
+    progress = Signal(str)
+    finished = Signal(bool, str)
+
+    def __init__(self, bootstrap_cls, config_path: str):
+        super().__init__()
+        self._bootstrap_cls = bootstrap_cls
+        self._config_path = config_path
+
+    def run(self):
+        # 安装 Signal 日志 handler，捕获 bootstrap 及其调用的子模块日志
+        handler = _SignalLogHandler(self.progress)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        targets = [
+            logging.getLogger("scripts.bootstrap"),
+            logging.getLogger("scripts.init_db"),
+            logging.getLogger("utils.credentials"),
+            logging.getLogger(),  # root，兜底
+        ]
+        for lg in targets:
+            lg.addHandler(handler)
+
+        try:
+            b = self._bootstrap_cls(config_path=self._config_path)
+            ok = b.run()
+            if ok:
+                summary = (
+                    "一键部署完成：PostgreSQL / Qdrant / MinIO 均已就绪，"
+                    "数据库表结构已初始化，凭据已写入 keyring，config.yaml 已回写。"
+                )
+            else:
+                summary = (
+                    "部署流程已执行，但部分服务未完全就绪。\n"
+                    "请查看日志中的 [ERROR] / [WARNING] 行确定失败项。\n"
+                    "PostgreSQL 或 Qdrant 失败时应用核心功能不可用；"
+                    "MinIO 失败会自动回退到本地文件存储。"
+                )
+            self.finished.emit(ok, summary)
+        except Exception as e:
+            logger.error(f"Bootstrap 执行异常: {e}", exc_info=True)
+            self.finished.emit(False, f"引导异常: {e}")
+        finally:
+            for lg in targets:
+                lg.removeHandler(handler)
 
 
 # ============================================================

@@ -25,7 +25,7 @@ from interfaces.parser import DocumentParser, ParsedDocument, ImageBlock
 from models.chunk import Chunk
 
 # 复用方案A 的 markdown 切分逻辑（结构感知，与具体 VLM 无关）
-from adapters.paddleocr_vl import _markdown_to_chunks
+from adapters.paddleocr_vl import _markdown_to_chunks, _is_text_file, _parse_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,11 @@ class MinerUModel:
 
     def parse_document(self, file_path: str) -> ParsedDocument:
         """解析文档，返回结构化 ParsedDocument。"""
+        # markdown / 纯文本文件无需 VLM 解析,直接读取走结构感知分块
+        # (MinerU 的 read_fn 不支持 .md 后缀,会抛 "Unknown file suffix")
+        if _is_text_file(file_path):
+            return _parse_text_file(file_path, parser_name="mineru")
+
         from mineru.cli.common import do_parse, read_fn  # API 以实际版本为准
 
         pdf_bytes = read_fn(file_path)

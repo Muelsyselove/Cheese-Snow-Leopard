@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QStackedWidget, QMessageBox, QFrame,
@@ -22,6 +24,8 @@ from PySide6.QtCore import Slot, Qt
 from ui.chat_panel import ChatPanel
 from ui.file_tree import FileTree
 from ui.knowledge_page import KnowledgePage
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -83,7 +87,10 @@ class MainWindow(QMainWindow):
         # 页面 1：文件
         self.file_tree = FileTree()
         self.file_tree.import_requested.connect(self.on_import_files)
+        self.file_tree.delete_requested.connect(self.on_delete_file)
         self.pages.addWidget(self.file_tree)
+        # 启动时从数据库恢复已导入文档
+        self._load_existing_documents()
 
         # 页面 2：知识库
         self.knowledge_page = KnowledgePage(
@@ -210,15 +217,27 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "重建失败", msg)
 
     # ---------------------------------------------------------- 文件导入
+    def _load_existing_documents(self):
+        """启动时从数据库恢复已导入文档到文件树"""
+        if not self.file_service:
+            return
+        try:
+            docs = self.file_service.list_documents()
+        except Exception as e:
+            logger.warning(f"加载已导入文档失败: {e}")
+            return
+        for doc in docs:
+            self.file_tree.add_document(doc)
+
     def on_import_files(self, paths: list[str]):
-        """UI 线程接收文件导入请求，启动 ParseWorker"""
+        """UI 线程接收文件导入请求，启动 ImportWorker（完整导入流程）"""
         if not self.file_service:
             QMessageBox.information(self, "提示", "文件服务未就绪")
             return
-        from workers.parse_worker import ParseWorker
-        self._parse_worker = ParseWorker(self.file_service.parser, paths)
+        from workers.import_worker import ImportWorker
+        self._parse_worker = ImportWorker(self.file_service, paths)
         self._parse_worker.progress.connect(self._update_progress)
-        self._parse_worker.finished.connect(self._on_parse_done)
+        self._parse_worker.finished.connect(self._on_import_done)
         self._parse_worker.error.connect(self._show_error)
         self._parse_worker.start()
 
@@ -227,7 +246,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{msg} ({percent}%)")
 
     @Slot(list)
-    def _on_parse_done(self, results):
+    def _on_import_done(self, results):
         for doc in results:
             self.file_tree.add_document(doc)
         self.statusBar().showMessage(f"已导入 {len(results)} 个文档")
@@ -236,3 +255,16 @@ class MainWindow(QMainWindow):
     def _show_error(self, msg: str):
         QMessageBox.critical(self, "错误", msg)
         self.statusBar().showMessage("操作失败")
+
+    @Slot(int)
+    def on_delete_file(self, doc_id: int):
+        """用户点击删除文档按钮，调用 lifecycle_service 删除"""
+        if not self.lifecycle_service:
+            QMessageBox.information(self, "提示", "生命周期服务未就绪")
+            return
+        try:
+            self.lifecycle_service.delete_document(doc_id)
+            self.statusBar().showMessage(f"文档删除任务已入队，将异步执行清理")
+        except Exception as e:
+            logger.error(f"删除文档失败 doc_id={doc_id}: {e}", exc_info=True)
+            QMessageBox.critical(self, "删除失败", f"删除文档失败: {e}")

@@ -1,6 +1,7 @@
 """OpenAI 兼容文字 LLM 实现 — 对接用户自有 API"""
 from __future__ import annotations
 
+import json
 import time
 from typing import Generator, Optional
 
@@ -55,7 +56,7 @@ class OpenAILLMClient:
                 resp = client.chat.completions.create(**kwargs)
                 return {
                     "content": resp.choices[0].message.content,
-                    "tool_calls": resp.choices[0].message.tool_calls,
+                    "tool_calls": self._convert_tool_calls(resp.choices[0].message.tool_calls),
                     "raw": resp
                 }
             except Exception as e:
@@ -64,6 +65,36 @@ class OpenAILLMClient:
                 wait = 2 ** attempt
                 time.sleep(wait)
         raise LLMError(f"LLM 调用失败（重试 {self.max_retries} 次）: {last_err}") from last_err
+
+    @staticmethod
+    def _convert_tool_calls(tool_calls):
+        """将 OpenAI SDK 的 ChatCompletionMessageToolCall 对象转为 langchain ToolCall dict 格式
+
+        langchain 的 AIMessage(tool_calls=...) 期望 list[dict]（含 name/args/id/type），
+        而 OpenAI SDK 返回的是对象。args 需从 JSON 字符串反序列化为 dict。
+        """
+        if not tool_calls:
+            return []
+        converted = []
+        for tc in tool_calls:
+            if getattr(tc, "type", None) != "function":
+                continue
+            fn = getattr(tc, "function", None)
+            if fn is None:
+                continue
+            args = {}
+            try:
+                import json
+                args = json.loads(fn.arguments or "{}")
+            except Exception:
+                args = {}
+            converted.append({
+                "name": fn.name,
+                "args": args,
+                "id": getattr(tc, "id", ""),
+                "type": "tool_call",
+            })
+        return converted
 
     @staticmethod
     def _convert_tools(tools: list) -> list[dict]:
@@ -108,14 +139,58 @@ class OpenAILLMClient:
                 converted.append(t)
         return converted
 
-    def stream_chat(self, messages: list[dict]) -> Generator[str, None, None]:
-        """流式聊天，逐 token 返回"""
+    def stream_chat(self, messages: list[dict],
+                    tools: Optional[list] = None,
+                    thinking: bool = True,
+                    should_stop=None) -> Generator[tuple[str, str], None, None]:
+        """流式聊天，逐 token 返回 (kind, text)。
+
+        kind:
+          - "reasoning"  思考过程（reasoning_content）
+          - "content"    正式回答内容
+          - "tool_call"  text 为 JSON 字符串（工具调用增量）
+        支持 should_stop 回调用于中途中断（返回 True 则停止）。
+        """
         client = self._get_client()
-        stream = client.chat.completions.create(
-            model=self.model, messages=messages,
-            temperature=self.temperature, max_tokens=self.max_tokens,
-            stream=True
-        )
+        openai_tools = self._convert_tools(tools) if tools else None
+        kwargs = {
+            "model": self.model, "messages": messages,
+            "temperature": self.temperature, "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if openai_tools:
+            kwargs["tools"] = openai_tools
+        # 思考开关：仅当显式要求思考时传参（部分模型不支持，失败则忽略）
+        if thinking:
+            try:
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            except Exception:
+                pass
+
+        stream = client.chat.completions.create(**kwargs)
         for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if should_stop is not None and should_stop():
+                return
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            # 思考过程（仅思考模式开启时展示）
+            if thinking:
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield ("reasoning", reasoning)
+            # 工具调用
+            if getattr(delta, "tool_calls", None):
+                for tc in delta.tool_calls:
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        yield ("tool_call", json.dumps({
+                            "index": tc.index,
+                            "id": tc.id,
+                            "name": fn.name,
+                            "arguments": fn.arguments or "",
+                        }, ensure_ascii=False))
+            # 正式回答
+            content = getattr(delta, "content", None)
+            if content:
+                yield ("content", content)

@@ -135,6 +135,17 @@ class PostgresRepository:
         )
         return [self._row_to_document(r) for r in rows]
 
+    def list_all_documents(self) -> list[Document]:
+        """查询全部文档（用于启动时恢复文件树展示）"""
+        rows = self._execute(
+            """SELECT doc_id, file_name, file_path, file_type, content_hash,
+                      page_count, upload_time, parse_status, fail_stage, fail_reason
+               FROM document_index
+               ORDER BY upload_time""",
+            fetch="all"
+        )
+        return [self._row_to_document(r) for r in rows]
+
     def delete_document(self, doc_id: int) -> None:
         """删除文档记录（物理删除，由补偿队列调用）"""
         self._execute(

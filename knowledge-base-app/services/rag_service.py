@@ -10,6 +10,7 @@ StateGraph 在 compile 时会调用 get_type_hints() 解析 TypedDict 注解，
 自定义 reducer 函数，导致 NameError。
 """
 import logging
+import json
 from typing import Optional, Annotated, TypedDict, Literal
 
 from interfaces.embedder import Embedder
@@ -45,17 +46,30 @@ def _to_openai_messages(messages: list) -> list[dict]:
             if tool_calls:
                 openai_calls = []
                 for tc in tool_calls:
-                    if isinstance(tc, dict):
+                    # 已是 OpenAI 格式（含 function/arguments）
+                    if isinstance(tc, dict) and "function" in tc:
                         openai_calls.append(tc)
-                    else:
+                        continue
+                    # langchain dict 格式：{name, args, id, type}
+                    if isinstance(tc, dict):
                         openai_calls.append({
-                            "id": getattr(tc, "id", ""),
+                            "id": tc.get("id", ""),
                             "type": "function",
                             "function": {
-                                "name": getattr(tc, "name", ""),
-                                "arguments": getattr(tc, "args", ""),
+                                "name": tc.get("name", ""),
+                                "arguments": json.dumps(tc.get("args", {}), ensure_ascii=False),
                             },
                         })
+                        continue
+                    # langchain 对象格式
+                    openai_calls.append({
+                        "id": getattr(tc, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc, "name", ""),
+                            "arguments": getattr(tc, "args", ""),
+                        },
+                    })
                 msg["tool_calls"] = openai_calls
             result.append(msg)
         elif cls_name == "ToolMessage":
@@ -82,6 +96,7 @@ class RagService:
         self.qdrant = qdrant_store
         self.config = config
         self.last_hit_chunk_ids: list[int] = []  # 缓存最近一次检索命中 ID
+        self.last_retrieved_chunks: set[str] = set()  # 最近一次流式查询的命中块 ID
 
     def hybrid_search(self, query: str, top_k: int = 20,
                       filters: Optional[dict] = None) -> list[Chunk]:
@@ -200,3 +215,115 @@ class RagService:
         retrieved_set = set(final_state.get("retrieved_chunks", []))
         answer = final_state["messages"][-1].content
         return {"answer": answer, "retrieved_chunks": retrieved_set}
+
+    def stream_query(self, user_question: str, history: list[dict] = None,
+                     llm=None, thinking: bool = True,
+                     should_stop=None):
+        """流式 RAG 查询（生成器）。
+
+        手动 agent 循环：检索阶段同样流式输出思考过程，最终回答逐 token 输出。
+        yield (kind, text)：
+          - "reasoning"  思考过程
+          - "content"    正式回答内容
+        命中块 ID 写入 self.last_retrieved_chunks，供调用方生成引用。
+
+        Args:
+            llm: 可选的 LLM 客户端覆盖
+            thinking: 是否启用思考
+            should_stop: 返回 True 则中断（用于手动停止）
+        """
+        used_llm = llm or self.llm
+        from langchain_core.tools import tool
+
+        @tool
+        def knowledge_search(query: str) -> str:
+            """搜索知识库相关内容"""
+            results = self.hybrid_search(query, top_k=20)
+            formatted = []
+            for chunk in results:
+                formatted.append(f"【chunk_{chunk.chunk_id}】{chunk.content}")
+            return "\n\n".join(formatted) if formatted else "未找到相关内容"
+
+        system = (
+            "你是知识库助手。需要查询知识库时使用 knowledge_search 工具。"
+            "回答时在引用处标注【chunk_<id>】。"
+        )
+
+        raw = [{"role": "system", "content": system}]
+        raw.extend(_to_openai_messages(history or []))
+        raw.append({"role": "user", "content": user_question})
+
+        retrieved_set: set[str] = set()
+        while True:
+            if should_stop is not None and should_stop():
+                return
+            # 流式调用 LLM，收集工具调用增量
+            tool_calls: dict[int, dict] = {}
+            order: list[int] = []
+            full_content = ""
+            for kind, text in used_llm.stream_chat(
+                    raw, tools=[knowledge_search],
+                    thinking=thinking, should_stop=should_stop):
+                if kind == "tool_call":
+                    data = json.loads(text)
+                    idx = data.get("index", 0)
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": data.get("id") or "",
+                            "name": data.get("name") or "",
+                            "arguments": "",
+                        }
+                        order.append(idx)
+                    if data.get("arguments"):
+                        tool_calls[idx]["arguments"] += data["arguments"]
+                    if data.get("name"):
+                        tool_calls[idx]["name"] = data["name"]
+                    if data.get("id"):
+                        tool_calls[idx]["id"] = data["id"]
+                elif kind == "reasoning":
+                    yield ("reasoning", text)
+                elif kind == "content":
+                    full_content += text
+                    yield ("content", text)
+
+            if not tool_calls:
+                # 最终回答结束
+                self.last_retrieved_chunks = retrieved_set
+                return
+
+            # 工具调用阶段：记录命中并执行工具
+            raw.append({
+                "role": "assistant",
+                "content": full_content or None,
+                "tool_calls": [
+                    {
+                        "id": tool_calls[i]["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_calls[i]["name"],
+                            "arguments": json.dumps(
+                                json.loads(tool_calls[i]["arguments"] or "{}"),
+                                ensure_ascii=False),
+                        },
+                    }
+                    for i in order
+                ],
+            })
+            for i in order:
+                tc = tool_calls[i]
+                name = tc["name"]
+                try:
+                    args = json.loads(tc["arguments"] or "{}")
+                except Exception:
+                    args = {}
+                if name == "knowledge_search":
+                    hits = self.last_hit_chunk_ids
+                    retrieved_set.update(f"chunk_{cid}" for cid in hits)
+                    result = knowledge_search.invoke(args)
+                else:
+                    result = "未知工具"
+                raw.append({
+                    "role": "tool",
+                    "content": str(result),
+                    "tool_call_id": tc["id"],
+                })

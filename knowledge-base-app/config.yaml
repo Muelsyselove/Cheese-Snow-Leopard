@@ -35,7 +35,7 @@ embedding:
 storage:
   minio:
     endpoint: localhost:9000
-    access_key: admin
+    access_key: keyring:minio_access_key
     bucket: knowledge-base
     secret_key: keyring:minio_secret_key
   postgres:
@@ -66,3 +66,10 @@ ui:
   window_width: 1400
   window_height: 900
   theme: dark
+services:
+  postgresql:
+    home: D:\doit\PostgreSQL16
+  qdrant:
+    home: D:\doit\Qdrant
+  minio:
+    home: D:\doit\MinIO
