@@ -225,6 +225,7 @@ class RagService:
         yield (kind, text)：
           - "reasoning"  思考过程
           - "content"    正式回答内容
+          - "step"       步骤事件 dict（检索开始/结束，供 UI 步骤时间线）
         命中块 ID 写入 self.last_retrieved_chunks，供调用方生成引用。
 
         Args:
@@ -317,9 +318,15 @@ class RagService:
                 except Exception:
                     args = {}
                 if name == "knowledge_search":
+                    query_arg = str(args.get("query", ""))
+                    yield ("step", {"op": "start", "kind": "search",
+                                    "detail": query_arg})
+                    result = knowledge_search.invoke(args)
+                    # hybrid_search 在 invoke 内更新 last_hit_chunk_ids，须在调用后读取
                     hits = self.last_hit_chunk_ids
                     retrieved_set.update(f"chunk_{cid}" for cid in hits)
-                    result = knowledge_search.invoke(args)
+                    yield ("step", {"op": "done", "kind": "search",
+                                    "detail": len(hits)})
                 else:
                     result = "未知工具"
                 raw.append({

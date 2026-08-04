@@ -45,7 +45,11 @@ class QdrantStore:
         return self._client
 
     def ensure_collection(self, dim: int):
-        """确保 collection 存在，按 dense(±sparse) 维度创建
+        """确保 collection 存在且其 schema 与当前 Embedding 配置匹配。
+
+        若已存在但 schema 不匹配（例如曾以 sparse_support=False 创建，现改用
+        BGE-M3 需要 sparse 向量），则重建该 collection，避免 upsert 报
+        "Not existing vector name error: sparse" 而无法向量化。
 
         Args:
             dim: dense 向量维度（如 BGE-M3=1024, Qwen3-0.6B=1024）
@@ -56,8 +60,14 @@ class QdrantStore:
         # 检查 collection 是否已存在(get_collection 在不存在时抛 404,需先列表检查)
         existing_collections = [c.name for c in client.get_collections().collections]
         if self.collection in existing_collections:
-            self._dim = dim
-            return
+            if self._schema_matches(dim):
+                self._dim = dim
+                return
+            logger.warning(
+                f"Qdrant collection {self.collection} 的 schema 与当前 Embedding "
+                f"配置不匹配（期望 dim={dim}, sparse={self.sparse_support}），重建以匹配配置"
+            )
+            client.delete_collection(self.collection)
 
         vectors_config = {self.DENSE_NAME: VectorParams(size=dim, distance=Distance.COSINE)}
         sparse_vectors_config = None
@@ -71,6 +81,27 @@ class QdrantStore:
         )
         self._dim = dim
         logger.info(f"Qdrant collection 已创建: {self.collection} (dim={dim}, sparse={self.sparse_support})")
+
+    def _schema_matches(self, dim: int) -> bool:
+        """校验已存在 collection 的 schema 是否匹配当前配置（dense 维度 + sparse 开关）。"""
+        client = self._get_client()
+        try:
+            info = client.get_collection(self.collection)
+        except Exception:
+            return False
+        params = getattr(getattr(info, "config", None), "params", None)
+        if params is None:
+            return False
+        vectors = getattr(params, "vectors", None)
+        existing_dim = None
+        if isinstance(vectors, dict):
+            dense = vectors.get(self.DENSE_NAME)
+            existing_dim = dense.size if dense is not None else None
+        elif vectors is not None:
+            existing_dim = getattr(vectors, "size", None)
+        sparse_vectors = getattr(params, "sparse_vectors", None) or {}
+        has_sparse = bool(sparse_vectors) and self.SPARSE_NAME in sparse_vectors
+        return existing_dim == dim and has_sparse == self.sparse_support
 
     def upsert(self, chunks: list[Chunk],
                embeddings: list[EmbeddingResult]) -> None:
@@ -108,12 +139,13 @@ class QdrantStore:
         """Dense 向量检索，返回 (chunk, rank) 列表，rank 从 1 开始"""
         client = self._get_client()
         qfilter = self._build_filter(filters) if filters else None
-        results = client.search(
+        results = client.query_points(
             collection_name=self.collection,
-            query_vector=(self.DENSE_NAME, query_vec.dense),
+            query=query_vec.dense,
+            using=self.DENSE_NAME,
             limit=top_k,
             query_filter=qfilter,
-        )
+        ).points
         return [(self._to_chunk(r), i + 1) for i, r in enumerate(results)]
 
     def search_sparse(self, query_vec: EmbeddingResult, top_k: int = 20,
@@ -133,12 +165,13 @@ class QdrantStore:
                 indices=indices,
                 values=[query_vec.sparse[i] for i in indices],
             )
-            results = client.search(
+            results = client.query_points(
                 collection_name=self.collection,
-                query_vector=(self.SPARSE_NAME, sparse_vec),
+                query=sparse_vec,
+                using=self.SPARSE_NAME,
                 limit=top_k,
                 query_filter=qfilter,
-            )
+            ).points
         else:
             query_text = getattr(query_vec, "query_text", None)
             if not query_text:

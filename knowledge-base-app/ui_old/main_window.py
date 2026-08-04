@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Slot, Qt
 
-from ui.chat_panel import ChatPanel
-from ui.file_tree import FileTree
-from ui.knowledge_page import KnowledgePage
+from ui_old.chat_panel import ChatPanel
+from ui_old.file_tree import FileTree
+from ui_old.knowledge_page import KnowledgePage
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +170,7 @@ class MainWindow(QMainWindow):
 
     def _load_settings_page(self):
         """首次切换到设置页时实例化设置界面（嵌入而非对话框）"""
-        from ui.settings_dialog import SettingsPage
+        from ui_old.settings_dialog import SettingsPage
         self._settings_widget = SettingsPage(
             parent=self, model_config_service=self.model_config_service
         )

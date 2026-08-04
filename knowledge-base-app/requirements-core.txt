@@ -6,6 +6,9 @@
 # 桌面 UI（必需）
 PySide6>=6.6.0
 
+# Web UI 内核（必需，默认 UI 路线：内置 WebView2 窗口，非外部浏览器）
+pywebview>=6.0
+
 # 配置加载（必需）
 PyYAML>=6.0.0
 

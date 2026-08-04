@@ -14,8 +14,8 @@ import logging
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser, QLineEdit, QPushButton,
-    QLabel, QListWidget, QListWidgetItem, QSplitter, QComboBox, QMessageBox,
-    QInputDialog, QMenu, QScrollArea,
+    QLabel, QListWidget, QListWidgetItem, QSplitter, QMessageBox,
+    QInputDialog, QMenu, QScrollArea, QDialog, QCheckBox, QFormLayout,
 )
 from PySide6.QtCore import Signal, Slot, Qt, QPoint
 from PySide6.QtGui import QTextCursor, QAction
@@ -162,6 +162,101 @@ class AssistantMessageWidget(QWidget):
         )
 
 
+class ConversationItemWidget(QWidget):
+    """对话列表项：标题 + 最右侧配置按钮"""
+
+    config_clicked = Signal(int)
+
+    def __init__(self, conv_id: int, title: str, parent=None):
+        super().__init__(parent)
+        self.conv_id = conv_id
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(4)
+
+        self.title_label = QLabel(title)
+        self.title_label.setWordWrap(False)
+        layout.addWidget(self.title_label, 1)
+
+        cfg_btn = QPushButton("⋯")
+        cfg_btn.setFixedSize(22, 22)
+        cfg_btn.setToolTip("对话设置（自动命名 / 手动命名 / 重新自动命名）")
+        cfg_btn.setCursor(Qt.PointingHandCursor)
+        cfg_btn.setStyleSheet(
+            "QPushButton { border:none; background:transparent; color:#888;"
+            " font-weight:bold; font-size:14px; }"
+            "QPushButton:hover { background:#e0e0e0; border-radius:3px; color:#333; }"
+        )
+        cfg_btn.clicked.connect(lambda: self.config_clicked.emit(self.conv_id))
+        layout.addWidget(cfg_btn)
+
+    def set_title(self, title: str):
+        self.title_label.setText(title)
+
+
+class ConversationConfigDialog(QDialog):
+    """对话设置对话框：自动命名开关 + 手动命名 + 重新自动命名"""
+
+    def __init__(self, parent, conv, panel: "ChatPanel"):
+        super().__init__(parent)
+        self.conv = conv
+        self.panel = panel
+        self.setWindowTitle("对话设置")
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.auto_name_cb = QCheckBox("开启自动命名")
+        self.auto_name_cb.setChecked(bool(conv.auto_name))
+        self.auto_name_cb.setToolTip("开启后，对话内容更新时将自动生成标题")
+        form.addRow("自动命名：", self.auto_name_cb)
+        layout.addLayout(form)
+
+        # 手动命名
+        layout.addWidget(QLabel("手动命名："))
+        manual_row = QHBoxLayout()
+        self.title_edit = QLineEdit(conv.title)
+        self.title_edit.setPlaceholderText("输入新对话名称")
+        manual_row.addWidget(self.title_edit, 1)
+        name_btn = QPushButton("命名")
+        name_btn.clicked.connect(self._on_manual_rename)
+        manual_row.addWidget(name_btn)
+        layout.addLayout(manual_row)
+
+        # 重新自动命名
+        re_btn = QPushButton("重新自动命名")
+        re_btn.setToolTip("使用自动命名模型重新生成标题")
+        re_btn.clicked.connect(self._on_re_auto_name)
+        layout.addWidget(re_btn)
+
+        # 按钮
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def _on_manual_rename(self):
+        text = self.title_edit.text().strip()
+        if not text:
+            self.title_edit.setFocus()
+            return
+        self.panel.chat_store.rename_conversation(self.conv.id, text)
+        self.panel._refresh_conversation_list()
+
+    def _on_re_auto_name(self):
+        self.panel._auto_name_conversation(self.conv.id)
+
+    def _on_save(self):
+        self.panel.chat_store.set_auto_name(
+            self.conv.id, self.auto_name_cb.isChecked())
+        self.accept()
+
+
 class ChatPanel(QWidget):
     """聊天面板 — 双栏：左对话列表 + 右对话窗口"""
 
@@ -226,24 +321,6 @@ class ChatPanel(QWidget):
         right_v = QVBoxLayout(right)
         right_v.setContentsMargins(4, 4, 4, 4)
 
-        # 顶部工具栏：模型选择 + 自动命名
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(QLabel("模型："))
-        self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(280)
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        toolbar.addWidget(self.model_combo, 1)
-
-        auto_name_btn = QPushButton("自动命名")
-        auto_name_btn.clicked.connect(self._on_auto_name)
-        toolbar.addWidget(auto_name_btn)
-
-        rename_btn = QPushButton("重命名")
-        rename_btn.clicked.connect(self._on_rename_conversation)
-        toolbar.addWidget(rename_btn)
-
-        right_v.addLayout(toolbar)
-
         # ---- 消息滚动区（消息型 widget 容器） ----
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -271,6 +348,19 @@ class ChatPanel(QWidget):
         )
         self.thinking_btn.toggled.connect(self._on_thinking_toggled)
         thinking_row.addWidget(self.thinking_btn)
+
+        # 模型选择：紧凑按钮，点击展开菜单
+        self.model_btn = QPushButton("模型")
+        self.model_btn.setCursor(Qt.PointingHandCursor)
+        self.model_btn.setToolTip("选择对话模型")
+        self.model_btn.setStyleSheet(
+            "QPushButton { padding:3px 10px; border:1px solid #b0b0b0;"
+            " border-radius:4px; background:#ffffff; color:#333; }"
+            "QPushButton:hover { border-color:#4a90d9; color:#1a5fa8; }"
+            "QPushButton:disabled { color:#aaa; border-color:#d0d0d0; }"
+        )
+        self.model_btn.clicked.connect(self._show_model_menu)
+        thinking_row.addWidget(self.model_btn)
         thinking_row.addStretch(1)
         right_v.addLayout(thinking_row)
 
@@ -304,43 +394,62 @@ class ChatPanel(QWidget):
 
     # ---------------------------------------------------------- 模型选择
     def _refresh_model_selector(self):
-        """刷新模型下拉框（仅已配置且已启用的模型）"""
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        if self.model_config_service is None:
-            self.model_combo.addItem("（未配置模型服务）", None)
-            self.model_combo.setEnabled(False)
-            self._current_model = None
-            self.model_combo.blockSignals(False)
-            return
+        """刷新模型紧凑按钮（含默认模型）"""
+        models = []
+        if self.model_config_service is not None:
+            models = self.model_config_service.list_enabled_models()
 
-        models = self.model_config_service.list_enabled_models()
         if not models:
-            self.model_combo.addItem("（暂无已启用模型，请到设置页配置）", None)
-            self.model_combo.setEnabled(False)
+            self.model_btn.setText("模型")
+            self.model_btn.setEnabled(False)
             self._current_model = None
-            self.model_combo.blockSignals(False)
             return
 
-        self.model_combo.setEnabled(True)
-        for provider_key, provider_name, model_name, model_display in models:
-            label = f"[{provider_name}] {model_display}"
-            data = (provider_key, model_name, model_display)
-            self.model_combo.addItem(label, data)
-        # 默认选第一个
-        self.model_combo.setCurrentIndex(0)
-        self._current_model = self.model_combo.itemData(0)
-        self.model_combo.blockSignals(False)
+        self.model_btn.setEnabled(True)
+        # 优先使用「默认对话模型」，否则选第一个
+        default = None
+        if self.model_config_service is not None:
+            default = self.model_config_service.get_default_models().get("chat")
+        if default:
+            for provider_key, _pn, model_name, model_display in models:
+                if provider_key == default[0] and model_name == default[1]:
+                    self._current_model = (provider_key, model_name, model_display)
+                    self.model_btn.setText(model_display)
+                    return
+        _pk, _pn, _mn, _md = models[0]
+        self._current_model = (_pk, _mn, _md)
+        self.model_btn.setText(_md)
 
     @Slot()
     def refresh_models(self):
-        """供外部调用：模型配置变更后刷新下拉框"""
+        """供外部调用：模型配置变更后刷新模型按钮"""
         self._refresh_model_selector()
 
-    def _on_model_changed(self):
-        data = self.model_combo.currentData()
+    def _show_model_menu(self):
+        """弹出紧凑模型选择菜单"""
+        menu = QMenu(self)
+        models = []
+        if self.model_config_service is not None:
+            models = self.model_config_service.list_enabled_models()
+        if not models:
+            act = menu.addAction("（暂无已启用模型，请到设置页配置）")
+            act.setEnabled(False)
+            menu.exec(self.model_btn.mapToGlobal(self.model_btn.rect().bottomLeft()))
+            return
+        for provider_key, provider_name, model_name, model_display in models:
+            label = f"[{provider_name}] {model_display}"
+            data = (provider_key, model_name, model_display)
+            act = menu.addAction(label)
+            act.setData(data)
+            act.triggered.connect(
+                lambda checked=False, d=data: self._apply_model(d)
+            )
+        menu.exec(self.model_btn.mapToGlobal(self.model_btn.rect().bottomLeft()))
+
+    def _apply_model(self, data):
+        """应用所选模型并记录到当前对话"""
         self._current_model = data
-        # 记录到当前对话
+        self.model_btn.setText(data[2])
         if data and self._current_conv_id and self.chat_store:
             self.chat_store.set_conversation_model(
                 self._current_conv_id, data[1]
@@ -372,14 +481,28 @@ class ChatPanel(QWidget):
             self.conv_list.blockSignals(False)
             return
         for conv in self.chat_store.list_conversations():
-            label = conv.title or "新对话"
-            item = QListWidgetItem(label)
+            item = QListWidgetItem()
             item.setData(Qt.UserRole, conv.id)
+            w = ConversationItemWidget(conv.id, conv.title or "新对话")
+            w.config_clicked.connect(self._on_conv_config)
+            item.setSizeHint(w.sizeHint())
             self.conv_list.addItem(item)
+            self.conv_list.setItemWidget(item, w)
         # 选中当前对话
         if self._current_conv_id is not None:
             self._select_conversation(self._current_conv_id)
         self.conv_list.blockSignals(False)
+
+    def _on_conv_config(self, conv_id: int):
+        """弹出对话设置对话框"""
+        if self.chat_store is None:
+            return
+        conv = self.chat_store.get_conversation(conv_id)
+        if conv is None:
+            return
+        dlg = ConversationConfigDialog(self, conv, self)
+        dlg.exec()
+        self._refresh_conversation_list()
 
     def _select_conversation(self, conv_id: int):
         for i in range(self.conv_list.count()):
@@ -428,19 +551,19 @@ class ChatPanel(QWidget):
                 w = self._add_assistant_message()
                 w.set_answer(msg.content)
         self._scroll_to_bottom()
-        # 匹配对话记录的模型到下拉框
+        # 匹配对话记录的模型到模型按钮
         if conv.model:
-            self._match_model_combo(conv.model)
+            self._match_model_button(conv.model)
 
-    def _match_model_combo(self, model_name: str):
-        """根据模型名匹配下拉框选项"""
-        for i in range(self.model_combo.count()):
-            data = self.model_combo.itemData(i)
-            if data and data[1] == model_name:
-                self.model_combo.blockSignals(True)
-                self.model_combo.setCurrentIndex(i)
-                self._current_model = data
-                self.model_combo.blockSignals(False)
+    def _match_model_button(self, model_name: str):
+        """根据模型名匹配模型按钮的当前模型"""
+        if self.model_config_service is None:
+            return
+        for provider_key, _pn, mname, mdisp in \
+                self.model_config_service.list_enabled_models():
+            if mname == model_name:
+                self._current_model = (provider_key, mname, mdisp)
+                self.model_btn.setText(mdisp)
                 return
 
     def _on_conv_context_menu(self, pos: QPoint):
@@ -486,13 +609,6 @@ class ChatPanel(QWidget):
             self.history = []
             self._clear_messages()
         self._refresh_conversation_list()
-
-    @Slot()
-    def _on_rename_conversation(self):
-        if self._current_conv_id is None:
-            QMessageBox.information(self, "提示", "请先选择一个对话")
-            return
-        self._rename_conv(self._current_conv_id)
 
     # ---------------------------------------------------------- 消息容器
     def _clear_messages(self):
@@ -646,6 +762,8 @@ class ChatPanel(QWidget):
                 self.chat_store.add_message(
                     self._current_conv_id, "assistant", answer
                 )
+            # 自动命名（若开启且尚未命名）
+            self._maybe_auto_name()
         self._set_generating(False)
         self._search_worker = None
         self._direct_worker = None
@@ -691,43 +809,73 @@ class ChatPanel(QWidget):
         self._scroll_to_bottom()
 
     # ---------------------------------------------------------- 自动命名
-    @Slot()
-    def _on_auto_name(self):
-        """用当前所选模型为对话生成标题"""
-        if self._current_conv_id is None:
-            QMessageBox.information(self, "提示", "请先选择或创建一个对话")
+    def _get_auto_naming_client(self):
+        """获取自动命名用的 LLM 客户端（优先使用「对话自动命名模型」）"""
+        if self.model_config_service is None:
+            return None
+        try:
+            rt = self.model_config_service.get_default_model_for_role("auto_naming")
+            if rt:
+                api_base, model_name, api_key = rt
+                from adapters.openai_llm import OpenAILLMClient
+                return OpenAILLMClient(
+                    api_base=api_base, api_key=api_key, model=model_name,
+                    temperature=0.3, max_tokens=4096, timeout=60,
+                )
+        except Exception as e:
+            logger.warning(f"使用自动命名模型失败，回退当前模型: {e}")
+        # 回退：当前选中模型
+        return self._get_llm_client()
+
+    def _auto_name_conversation(self, conv_id: int):
+        """为指定对话生成标题"""
+        if self.chat_store is None:
             return
-        if not self.history:
-            QMessageBox.information(self, "提示", "对话尚无内容，无法命名")
+        conv = self.chat_store.get_conversation(conv_id)
+        if conv is None:
             return
-        llm = self._get_llm_client()
-        if llm is None:
-            QMessageBox.warning(self, "提示", "请先选择一个已配置的模型")
-            return
-        # 取第一轮 user + assistant
+        messages = self.chat_store.list_messages(conv_id)
         user_msg = ""
         assistant_msg = ""
-        for m in self.history:
-            if m["role"] == "user" and not user_msg:
-                user_msg = m["content"]
-            elif m["role"] == "assistant" and not assistant_msg:
-                assistant_msg = m["content"]
+        for m in messages:
+            if m.role == "user" and not user_msg:
+                user_msg = m.content
+            elif m.role == "assistant" and not assistant_msg:
+                assistant_msg = m.content
             if user_msg and assistant_msg:
                 break
         if not user_msg:
-            QMessageBox.information(self, "提示", "无用户消息可用于命名")
+            QMessageBox.information(self, "提示", "对话尚无内容，无法命名")
+            return
+
+        llm = self._get_auto_naming_client()
+        if llm is None:
+            QMessageBox.warning(self, "提示", "请先在「设置」中配置模型用于自动命名")
             return
 
         from workers.llm_worker import TitleWorker
         self._title_worker = TitleWorker(llm, user_msg, assistant_msg)
-        self._title_worker.finished.connect(self._on_title_done)
+        self._title_worker.finished.connect(
+            lambda title, cid=conv_id: self._on_title_done(title, cid)
+        )
         self._title_worker.error.connect(self._on_title_error)
         self._title_worker.start()
 
-    @Slot(str)
-    def _on_title_done(self, title: str):
-        if self._current_conv_id and self.chat_store:
-            self.chat_store.rename_conversation(self._current_conv_id, title)
+    def _maybe_auto_name(self):
+        """对话更新后，若开启自动命名且尚未命名，则异步生成标题"""
+        if self._current_conv_id is None or self.chat_store is None:
+            return
+        conv = self.chat_store.get_conversation(self._current_conv_id)
+        if conv is None or not conv.auto_name:
+            return
+        if conv.title and conv.title != "新对话":
+            return
+        self._auto_name_conversation(self._current_conv_id)
+
+    @Slot(str, int)
+    def _on_title_done(self, title: str, conv_id: int):
+        if self.chat_store:
+            self.chat_store.rename_conversation(conv_id, title)
             self._refresh_conversation_list()
         self._title_worker = None
 

@@ -22,5 +22,5 @@ class TestCredentials:
         """未设置的凭据应抛出 ValueError"""
         with patch("utils.credentials.get_credential", return_value=None):
             import pytest
-            with pytest.raises(ValueError, match="未在 keyring 中设置"):
+            with pytest.raises(ValueError, match="未设置"):
                 resolve_credential_placeholder("keyring:missing_key")

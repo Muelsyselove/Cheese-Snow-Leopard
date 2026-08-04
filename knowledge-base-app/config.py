@@ -25,6 +25,7 @@ class AppConfig:
     concurrency: dict
     ui: dict
     paths: dict = field(default_factory=dict)
+    compute: dict = field(default_factory=dict)
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -48,6 +49,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         concurrency=data.get("concurrency", {}),
         ui=data.get("ui", {}),
         paths=paths_cfg,
+        compute=data.get("compute", {}),
     )
 
 

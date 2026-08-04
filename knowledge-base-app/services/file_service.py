@@ -79,7 +79,7 @@ class FileService:
             parse_status="parsing"
         )
         try:
-            # 阶段 2: 解析 + 分块 + 编码
+            # 阶段 2: 解析 + 分块
             _report(15, "解析文档")
             parsed = self.parser.parse_document(file_path)
             chunks = self.chunker.split(parsed)
@@ -88,24 +88,32 @@ class FileService:
                 chunk.doc_id = doc_id
                 chunk.doc_name = file_name
                 chunk.content_hash = compute_hash(chunk.content)
-            self.pg.update_parse_status(doc_id, "embedding")
+            if not chunks:
+                _report(100, "完成（无有效内容）")
+                self.pg.update_parse_status(doc_id, "completed")
+                logger.info(f"文档导入成功（空内容） doc_id={doc_id}")
+                return doc_id
 
-            # 阶段 3: 向量化
-            _report(45, "向量化")
-            embeddings = self.embedder.encode([c.content for c in chunks])
+            # 阶段 3: AI 分类（参考现有分类、允许多分类；分块已分段，逐个提交）
+            _report(45, "AI 分类")
             self.pg.update_parse_status(doc_id, "classifying")
-
-            # 阶段 4: LLM 分类
-            _report(70, "AI 分类")
             classifications = self.classify.classify(chunks)
-            self.pg.update_parse_status(doc_id, "storing")
+
+            # 阶段 4: 向量化（基于提取出的知识块内容）
+            _report(70, "向量化")
+            self.pg.update_parse_status(doc_id, "embedding")
+            embeddings = self.embedder.encode([c.content for c in chunks])
 
             # 阶段 5: 写 chunk_index + chunk_category
-            _report(85, "写入存储")
+            _report(80, "写入存储")
+            self.pg.update_parse_status(doc_id, "storing")
             self.pg.insert_chunks(chunks, classifications)
 
-            # 阶段 6: 写 Qdrant（最后一步，失败时入补偿队列）
+            # 阶段 6: 写 Qdrant（先确保 collection 存在且 schema 匹配，失败时入补偿队列）
+            _report(90, "写入向量库")
             try:
+                dim = len(embeddings[0].dense) if embeddings else 0
+                self.qdrant.ensure_collection(dim)
                 self.qdrant.upsert(chunks, embeddings)
             except Exception as qe:
                 self.compensation.enqueue("delete_pg_chunks", str(doc_id))
@@ -252,21 +260,26 @@ class FileService:
                 chunk.doc_id = doc_id
                 chunk.doc_name = file_name
                 chunk.content_hash = compute_hash(chunk.content)
-            self.pg.update_parse_status(doc_id, "embedding")
+            if not chunks:
+                self.pg.update_parse_status(doc_id, "completed")
+                return
 
-            # 阶段 3: 向量化
-            embeddings = self.embedder.encode([c.content for c in chunks])
+            # 阶段 3: AI 分类
             self.pg.update_parse_status(doc_id, "classifying")
-
-            # 阶段 4: LLM 分类
             classifications = self.classify.classify(chunks)
-            self.pg.update_parse_status(doc_id, "storing")
+
+            # 阶段 4: 向量化
+            self.pg.update_parse_status(doc_id, "embedding")
+            embeddings = self.embedder.encode([c.content for c in chunks])
 
             # 阶段 5: 写 chunk_index + chunk_category
+            self.pg.update_parse_status(doc_id, "storing")
             self.pg.insert_chunks(chunks, classifications)
 
-            # 阶段 6: 写 Qdrant
+            # 阶段 6: 写 Qdrant（先确保 collection 存在且 schema 匹配）
             try:
+                dim = len(embeddings[0].dense) if embeddings else 0
+                self.qdrant.ensure_collection(dim)
                 self.qdrant.upsert(chunks, embeddings)
             except Exception as qe:
                 self.compensation.enqueue("delete_pg_chunks", str(doc_id))

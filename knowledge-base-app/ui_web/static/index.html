@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识学爆 Cheese Snow Leopard</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <!-- Aurora 渐变光效基底 -->
+  <div class="aurora" aria-hidden="true">
+    <div class="blob blob-cyan"></div>
+    <div class="blob blob-violet"></div>
+    <div class="blob blob-pink"></div>
+  </div>
+
+  <div id="app">
+    <!-- 标题栏（frameless 自绘） -->
+    <header id="titlebar" class="drag-region">
+      <div class="tb-left">
+        <span class="tb-logo">🐆</span>
+        <span class="tb-title" data-i18n="app.title">知识学爆 Cheese Snow Leopard</span>
+      </div>
+      <div class="tb-actions">
+        <button id="btn-min" class="tb-btn" data-i18n-title="window.minimize" title="最小化">
+          <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2" y1="6" x2="10" y2="6" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+        <button id="btn-max" class="tb-btn" data-i18n-title="window.maximize" title="最大化">
+          <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2.5" y="2.5" width="7" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+        <button id="btn-close" class="tb-btn tb-close" data-i18n-title="window.closeTip" title="关闭">
+          <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2.5" y1="2.5" x2="9.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/><line x1="9.5" y1="2.5" x2="2.5" y2="9.5" stroke="currentColor" stroke-width="1.2"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="main">
+      <!-- 导航栏 -->
+      <nav id="navrail" class="glass">
+        <div class="brand">
+          <div class="avatar glass-avatar">🐆</div>
+          <div class="brand-text">
+            <div class="brand-name" data-i18n="app.name">知识学爆</div>
+            <div class="brand-sub" data-i18n="app.name.en">Cheese Snow Leopard</div>
+          </div>
+        </div>
+        <button class="nav-btn active" data-page="chat">
+          <span class="nav-icon">💬</span><span data-i18n="nav.chat">对话</span>
+        </button>
+        <button class="nav-btn" data-page="files">
+          <span class="nav-icon">📁</span><span data-i18n="nav.files">文件</span>
+        </button>
+        <button class="nav-btn" data-page="knowledge">
+          <span class="nav-icon">🏷️</span><span data-i18n="nav.knowledge">知识库</span>
+        </button>
+        <button class="nav-btn" data-page="settings">
+          <span class="nav-icon">⚙️</span><span data-i18n="nav.settings">设置</span>
+        </button>
+        <div class="nav-spacer"></div>
+      </nav>
+
+      <!-- 页面栈 -->
+      <main id="pages">
+        <section id="page-chat" class="page active"></section>
+        <section id="page-files" class="page"></section>
+        <section id="page-knowledge" class="page"></section>
+        <section id="page-settings" class="page"></section>
+      </main>
+    </div>
+
+    <!-- 状态栏 -->
+    <footer id="statusbar" class="glass">
+      <span id="status-text" data-i18n="status.ready">就绪</span>
+    </footer>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="glass" role="status"></div>
+
+  <!-- 模态对话框挂载点 -->
+  <div id="modal-root"></div>
+
+  <script src="js/app.js"></script>
+  <script src="js/chat.js"></script>
+  <script src="js/files.js"></script>
+  <script src="js/knowledge.js"></script>
+  <script src="js/settings.js"></script>
+</body>
+</html>

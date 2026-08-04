@@ -51,3 +51,6 @@ models_cache/
 # 配置（含凭据占位符的 config 可入库，但本地覆盖配置不入库）
 config.local.yaml
 providers.yaml
+
+# 敏感凭据（明文密钥，严禁入库）
+credentials.json

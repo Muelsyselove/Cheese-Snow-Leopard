@@ -21,11 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    # 0. 先启动 QApplication（只需 PySide6，确保窗口能显示）
-    from PySide6.QtWidgets import QApplication, QMessageBox
-    app = QApplication(sys.argv)
-
-    # 收集启动过程中的错误（非致命错误不阻塞 UI）
+    # 收集启动过程中的错误（非致命错误不阻塞 UI，由新 UI 玻璃对话框展示）
     startup_errors: list[str] = []
 
     # 1. 加载配置（keyring 占位符自动解析为真实凭据）
@@ -40,6 +36,17 @@ def main():
     except Exception as e:
         startup_errors.append(f"配置加载失败: {e}")
         logger.error(f"配置加载失败: {e}", exc_info=True)
+
+    # 1.5 计算设备选择（必须在任何 CUDA 上下文初始化之前执行：
+    #     torch 的 import 本身安全，CUDA 上下文在首次调用时才创建）
+    compute_device_desc = "cpu"
+    if config is not None:
+        try:
+            from services.gpu_service import apply_compute_device
+            compute_device_desc = apply_compute_device(
+                (config.compute or {}).get("device", "auto"))
+        except Exception as e:
+            logger.warning(f"计算设备选择失败（按默认继续）: {e}")
 
     # 2. 创建组件实例（容错：任一失败不阻塞 UI）
     parser = embedder = llm = qdrant = snowflake = None
@@ -187,22 +194,11 @@ def main():
         if reconciler is None: missing.append("reconciler")
         logger.warning(f"文件服务未就绪，缺失依赖: {', '.join(missing)}")
 
-    # 5. 启动主窗口（即使部分服务为 None 也能显示）
-    from ui.main_window import MainWindow
-    window = MainWindow(
-        rag_service=rag_service, lifecycle_service=lifecycle_service,
-        file_service=file_service,
-        config=config.ui if config else {}
-    )
-    window.show()
-    logger.info("应用已启动")
-
-    # 5.5 如有启动错误，弹窗提示（不阻塞）
-    if startup_errors:
-        QMessageBox.warning(
-            window, "启动警告",
-            "部分功能不可用（应用仍可运行）：\n\n" + "\n".join(startup_errors)
-        )
+    # 5. 启动液态玻璃 UI（即使部分服务为 None 也能显示）
+    from services.model_config_service import ModelConfigService
+    from services.chat_store import ChatStore
+    model_config_service = ModelConfigService()
+    chat_store = ChatStore()
 
     # 6. 启动补偿队列 reconciler（后台线程，仅当就绪时）
     import threading
@@ -228,7 +224,36 @@ def main():
                 logger.error(f"向量模型预加载失败: {e}", exc_info=True)
         threading.Thread(target=_preload_embedder, daemon=True).start()
 
-    sys.exit(app.exec())
+    # 9. 装配并运行 UI
+    #    默认：Web 路线（ui_web/，pywebview + WebView2 内核，内置窗口非外部浏览器）
+    #    回退：--ui=qml 启动 old_v2 QML UI（已弃用，不再受系统支持和更新）
+    ui_mode = "web"
+    for arg in sys.argv[1:]:
+        if arg.startswith("--ui="):
+            ui_mode = arg.split("=", 1)[1].strip().lower()
+
+    if ui_mode == "qml":
+        logger.info("UI 模式: old_v2 QML（已弃用）")
+        from ui_old_v2.app import run_ui
+        exit_code = run_ui(
+            file_service=file_service, rag_service=rag_service,
+            lifecycle_service=lifecycle_service,
+            model_config_service=model_config_service, chat_store=chat_store,
+            pg_repo=pg_repo,
+            ui_config=config.ui if config else {},
+            startup_errors=startup_errors,
+        )
+    else:
+        logger.info("UI 模式: web（WebView2 内置内核）")
+        from ui_web.app import run_web_ui
+        exit_code = run_web_ui(
+            file_service=file_service, rag_service=rag_service,
+            lifecycle_service=lifecycle_service,
+            model_config_service=model_config_service, chat_store=chat_store,
+            pg_repo=pg_repo,
+            startup_errors=startup_errors,
+        )
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

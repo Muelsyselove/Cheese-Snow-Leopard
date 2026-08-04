@@ -62,10 +62,13 @@ concurrency:
   llm_rpm: 60
   llm_tpm: 90000
   import_queue_size: 16
+compute:
+  device: auto
 ui:
   window_width: 1400
   window_height: 900
   theme: dark
+  language: zh_CN
 services:
   postgresql:
     home: D:\doit\PostgreSQL16
@@ -73,3 +76,13 @@ services:
     home: D:\doit\Qdrant
   minio:
     home: D:\doit\MinIO
+default_models:
+  chat:
+  - deepseek
+  - deepseek-v4-flash
+  knowledge_base:
+  - deepseek
+  - deepseek-v4-flash
+  auto_naming:
+  - deepseek
+  - deepseek-v4-flash

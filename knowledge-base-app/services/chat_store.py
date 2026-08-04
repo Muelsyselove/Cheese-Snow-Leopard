@@ -23,6 +23,7 @@ class Conversation:
     id: int
     title: str
     model: str = ""
+    auto_name: bool = True
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -62,6 +63,7 @@ class ChatStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL DEFAULT '新对话',
                     model TEXT NOT NULL DEFAULT '',
+                    auto_name INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -76,6 +78,14 @@ class ChatStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_conv
                     ON messages(conversation_id);
             """)
+            # 迁移：老库补充 auto_name 列
+            cols = [r[1] for r in conn.execute(
+                "PRAGMA table_info(conversations)").fetchall()]
+            if "auto_name" not in cols:
+                conn.execute(
+                    "ALTER TABLE conversations "
+                    "ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 1"
+                )
 
     # ---------------------------------------------------------- 对话
     def create_conversation(self, title: str = "新对话",
@@ -83,12 +93,13 @@ class ChatStore:
         now = time.time()
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO conversations (title, model, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO conversations (title, model, auto_name, "
+                "created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
                 (title, model, now, now),
             )
             conv_id = cur.lastrowid
             return Conversation(id=conv_id, title=title, model=model,
+                                auto_name=True,
                                 created_at=now, updated_at=now)
 
     def list_conversations(self) -> list[Conversation]:
@@ -98,6 +109,7 @@ class ChatStore:
             ).fetchall()
             return [Conversation(
                 id=r["id"], title=r["title"], model=r["model"],
+                auto_name=bool(r["auto_name"]),
                 created_at=r["created_at"], updated_at=r["updated_at"],
             ) for r in rows]
 
@@ -110,6 +122,7 @@ class ChatStore:
                 return None
             return Conversation(
                 id=r["id"], title=r["title"], model=r["model"],
+                auto_name=bool(r["auto_name"]),
                 created_at=r["created_at"], updated_at=r["updated_at"],
             )
 
@@ -127,6 +140,15 @@ class ChatStore:
             conn.execute(
                 "UPDATE conversations SET model = ?, updated_at = ? WHERE id = ?",
                 (model, now, conv_id),
+            )
+
+    def set_auto_name(self, conv_id: int, enabled: bool):
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET auto_name = ?, updated_at = ? "
+                "WHERE id = ?",
+                (1 if enabled else 0, now, conv_id),
             )
 
     def delete_conversation(self, conv_id: int):

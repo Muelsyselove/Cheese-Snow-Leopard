@@ -31,6 +31,14 @@ from utils.credentials import get_credential, set_credential, delete_credential
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "providers.yaml"
+CONFIG_YAML_PATH = "config.yaml"
+
+# 各功能用途的默认模型角色
+DEFAULT_ROLES = {
+    "chat": "默认对话模型",
+    "knowledge_base": "知识库管家",
+    "auto_naming": "对话自动命名模型",
+}
 
 
 def _keyring_key_for(provider_key: str) -> str:
@@ -65,8 +73,10 @@ class ProviderConfig:
 class ModelConfigService:
     """模型配置服务 — 读写 providers.yaml + keyring"""
 
-    def __init__(self, config_path: str = CONFIG_PATH):
+    def __init__(self, config_path: str = CONFIG_PATH,
+                 config_yaml_path: str = CONFIG_YAML_PATH):
         self.config_path = config_path
+        self.config_yaml_path = config_yaml_path
         self._cache: dict[str, ProviderConfig] = {}
         self.load()
 
@@ -274,3 +284,51 @@ class ModelConfigService:
         except Exception as e:
             logger.error(f"同步默认模型到 config.yaml 失败: {e}")
             return False
+
+    # ---------------------------------------------------------- 默认模型按用途选择
+    def get_default_models(self) -> dict[str, tuple[str, str] | None]:
+        """获取各用途默认模型配置 {role: (provider_key, model_name)}"""
+        try:
+            with open(self.config_yaml_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"读取 config.yaml 获取默认模型失败: {e}")
+            return {}
+
+        defaults = cfg.get("default_models", {})
+        result: dict[str, tuple[str, str] | None] = {}
+        for role in DEFAULT_ROLES:
+            val = defaults.get(role)
+            if val and isinstance(val, list) and len(val) == 2:
+                result[role] = (val[0], val[1])
+            else:
+                result[role] = None
+        return result
+
+    def set_default_model(self, role: str, provider_key: str, model_name: str):
+        """设置某用途的默认模型，保存到 config.yaml"""
+        try:
+            with open(self.config_yaml_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"读取 config.yaml 失败: {e}")
+            raise
+
+        cfg.setdefault("default_models", {})
+        cfg["default_models"][role] = [provider_key, model_name]
+
+        try:
+            with open(self.config_yaml_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            logger.error(f"写入 config.yaml 失败: {e}")
+            raise
+
+    def get_default_model_for_role(self, role: str) -> tuple[str, str, str] | None:
+        """获取指定用途默认模型的运行时配置 (api_base, model_name, api_key)"""
+        defaults = self.get_default_models()
+        model_ref = defaults.get(role)
+        if not model_ref:
+            return None
+        provider_key, model_name = model_ref
+        return self.get_model_runtime(provider_key, model_name)

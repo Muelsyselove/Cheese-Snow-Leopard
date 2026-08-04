@@ -2,10 +2,9 @@
 
 四块功能：
 1. 模型配置：双栏布局（左侧厂商列表，右侧模型管理），每厂商独立 API Key。
-2. 凭据配置：PostgreSQL/MinIO 密码 + 一键自动配置（生成密码 + 写 keyring + 更新 config.yaml）。
+2. 凭据配置：PostgreSQL/MinIO 密码 + 一键自动配置（生成密码 + 写入本地凭据文件 + 更新 config.yaml）。
 3. 依赖管理：核心依赖状态展示 + 可选组件勾选安装/卸载。
-4. 方案选择：VLM/Embedding provider 切换（写回 config.yaml）。
-"""
+4. 方案选择：VLM/Embedding provider 切换（写回 config.yaml）。"""
 from __future__ import annotations
 
 import logging
@@ -23,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from services.dependency_service import DependencyService
 from services.credential_service import CredentialService
-from services.model_config_service import ModelConfigService
+from services.model_config_service import ModelConfigService, DEFAULT_ROLES
 from utils.credentials import get_credential, set_credential
 from presets.llm_providers import PROVIDERS, get_provider
 
@@ -100,6 +99,7 @@ class SettingsPage(QWidget):
         v.setSpacing(12)
 
         v.addWidget(self._build_model_group())
+        v.addWidget(self._build_default_model_group())
         v.addWidget(self._build_data_location_group())
         v.addWidget(self._build_credential_group())
         v.addWidget(self._build_dep_group())
@@ -368,6 +368,75 @@ class SettingsPage(QWidget):
         box.setText(msg)
         box.exec()
 
+    # ---------------------- 默认模型配置 ----------------------
+    def _build_default_model_group(self) -> QGroupBox:
+        group = QGroupBox("默认模型配置")
+        v = QVBoxLayout(group)
+
+        hint = QLabel(
+            "为各功能指定默认模型（可选已配置且已启用的模型）。\n"
+            "未设置时自动使用第一个已配置且已启用的模型。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 12px;")
+        v.addWidget(hint)
+
+        form = QFormLayout()
+        self._default_combos: dict[str, QComboBox] = {}
+        for role, label in DEFAULT_ROLES.items():
+            combo = QComboBox()
+            combo.addItem("（自动选择）", None)
+            for pk, _pn, mn, md in self._model_svc.list_enabled_models():
+                combo.addItem(f"[{_pn}] {md}", (pk, mn))
+            self._default_combos[role] = combo
+            form.addRow(f"{label}：", combo)
+        v.addLayout(form)
+
+        save_btn = QPushButton("保存默认模型")
+        save_btn.clicked.connect(self._on_save_default_models)
+        v.addWidget(save_btn)
+
+        self._default_model_status = QLabel()
+        self._default_model_status.setWordWrap(True)
+        self._default_model_status.setStyleSheet("color: #666; font-size: 12px;")
+        v.addWidget(self._default_model_status)
+
+        self._load_default_models()
+        return group
+
+    def _load_default_models(self):
+        """回填当前默认模型到下拉框"""
+        defaults = self._model_svc.get_default_models()
+        for role, combo in self._default_combos.items():
+            model_ref = defaults.get(role)
+            if model_ref:
+                idx = combo.findData(model_ref)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+        self._refresh_default_model_status()
+
+    def _refresh_default_model_status(self):
+        defaults = self._model_svc.get_default_models()
+        parts = []
+        for role, label in DEFAULT_ROLES.items():
+            model_ref = defaults.get(role)
+            if model_ref:
+                parts.append(f"{label}={model_ref[1]}")
+            else:
+                parts.append(f"{label}=自动")
+        self._default_model_status.setText("当前： " + "，".join(parts))
+
+    def _on_save_default_models(self):
+        try:
+            for role, combo in self._default_combos.items():
+                data = combo.currentData()
+                if data:
+                    self._model_svc.set_default_model(role, data[0], data[1])
+            self._refresh_default_model_status()
+            QMessageBox.information(self, "成功", "默认模型配置已保存。")
+        except Exception as e:
+            QMessageBox.critical(self, "失败", f"保存默认模型失败: {e}")
+
     # ---------------------- 数据存储位置 ----------------------
     def _build_data_location_group(self) -> QGroupBox:
         group = QGroupBox("数据存储位置")
@@ -458,8 +527,8 @@ class SettingsPage(QWidget):
         v = QVBoxLayout(group)
 
         hint = QLabel(
-            "敏感凭据通过系统 keyring 安全存储，不写入 config.yaml 明文。\n"
-            "Windows 凭据管理器 / macOS Keychain / Linux Secret Service。"
+            "敏感凭据（PostgreSQL / MinIO 密码等）保存在程序目录下的 credentials.json 中，\n"
+            "不写入 config.yaml 明文，随程序目录整体迁移，重启后不丢失。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666; font-size: 12px;")
@@ -513,7 +582,7 @@ class SettingsPage(QWidget):
         auto_box = QGroupBox("一键自动配置（使服务可直接运行）")
         auto_v = QVBoxLayout(auto_box)
         auto_hint = QLabel(
-            "自动生成 PostgreSQL / MinIO 随机密码并写入 keyring，\n"
+            "自动生成 PostgreSQL / MinIO 随机密码并写入本地凭据文件，\n"
             "同时更新 config.yaml 引用，确保重启后服务可连接。\n"
             "若已配置模型，也一并同步默认模型到 config.yaml。\n"
             "注意：需确保本地 PostgreSQL / MinIO 服务使用相同密码。"
@@ -539,7 +608,7 @@ class SettingsPage(QWidget):
             self, "确认一键完成配置",
             "将自动执行完整部署流程：\n"
             "  - 发现并启动 PostgreSQL / Qdrant / MinIO（未安装的自动下载）\n"
-            "  - 生成随机密码并写入 keyring\n"
+            "  - 生成随机密码并写入本地凭据文件\n"
             "  - 创建数据库用户 / 库 / 表结构\n"
             "  - 回写 config.yaml 引用\n"
             "  - 同步模型默认配置\n\n"
@@ -914,7 +983,7 @@ class _BootstrapWorker(QObject):
             if ok:
                 summary = (
                     "一键部署完成：PostgreSQL / Qdrant / MinIO 均已就绪，"
-                    "数据库表结构已初始化，凭据已写入 keyring，config.yaml 已回写。"
+                    "数据库表结构已初始化，凭据已写入本地凭据文件，config.yaml 已回写。"
                 )
             else:
                 summary = (

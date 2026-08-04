@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal, Slot
 
-from ui.category_tree import CategoryTree
+from ui_old.category_tree import CategoryTree
 
 
 class KnowledgePage(QWidget):

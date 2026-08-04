@@ -40,6 +40,9 @@ class Qwen3Embedder:
             self._model = AutoModel.from_pretrained(
                 self.model_name, trust_remote_code=True
             )
+            # 遵循启动时选定的计算设备（CUDA_VISIBLE_DEVICES 已统一限定）
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._model = self._model.to(self._device)
             self._torch = torch
 
     def encode(self, texts: list[str]) -> list[EmbeddingResult]:
@@ -49,7 +52,7 @@ class Qwen3Embedder:
         inputs = self._tokenizer(
             texts, padding=True, truncation=True,
             max_length=self.max_length, return_tensors="pt"
-        )
+        ).to(self._device)
         with torch.no_grad():
             outputs = self._model(**inputs)
         dense_vecs = self._last_token_pool(
@@ -70,7 +73,9 @@ class Qwen3Embedder:
             return last_hidden_state[:, -1]
         sequence_lengths = attention_mask.sum(dim=1) - 1
         return last_hidden_state[
-            torch.arange(last_hidden_state.size(0)), sequence_lengths
+            torch.arange(last_hidden_state.size(0),
+                         device=last_hidden_state.device),
+            sequence_lengths,
         ]
 
     @property

@@ -11,6 +11,7 @@ class SearchWorker(QThread):
     progress = Signal(int, str)
     reasoning_stream = Signal(str)    # 思考过程逐 token 输出
     token_stream = Signal(str)        # 正式回答逐 token 输出
+    step_event = Signal(object)       # 步骤事件 {"op": start|done, "kind": str, "detail": ...}
     finished = Signal(dict)           # {"answer": str, "retrieved_chunks": set}
     error = Signal(str)
 
@@ -43,6 +44,8 @@ class SearchWorker(QThread):
                 elif kind == "content":
                     answer += text
                     self.token_stream.emit(text)
+                elif kind == "step":
+                    self.step_event.emit(text)
             self.progress.emit(100, "检索完成")
             # 引用来源：同一线程内 stream_query 已写入 last_retrieved_chunks
             retrieved = set(getattr(self.rag, "last_retrieved_chunks", set()))

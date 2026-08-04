@@ -88,6 +88,43 @@ def _wait_for_port(host: str, port: int, timeout: int = 30, interval: float = 1.
     return False
 
 
+def _run(cmd, timeout: int = 20, devnull: bool = False, **kwargs) -> subprocess.CompletedProcess | None:
+    """带超时的 subprocess.run，超时或异常返回 None（避免引导脚本无限挂起）。
+
+    当命令会衍生后台进程（如 pg_ctl start）时须传 devnull=True：用 DEVNULL 重定向
+    stdout/stderr，避免后台进程继承管道导致 subprocess 等待 EOF 永久挂起。
+    """
+    try:
+        if devnull:
+            kwargs.setdefault("stdout", subprocess.DEVNULL)
+            kwargs.setdefault("stderr", subprocess.DEVNULL)
+        else:
+            kwargs.setdefault("capture_output", True)
+        return subprocess.run(cmd, text=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[超时] 命令执行超时({timeout}s): {' '.join(map(str, cmd))}")
+        return None
+    except Exception as e:
+        logger.warning(f"[错误] 命令执行失败: {' '.join(map(str, cmd))} => {e}")
+        return None
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """探测 PID 对应的进程是否存活。True=存活 / False=已死 / None=无法判断
+
+    注意：Windows 上 os.kill(pid, 0) 可能真的终止进程，故用 tasklist 探测。
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        text = (out.stdout or "") + (out.stderr or "")
+        return str(pid) in text
+    except Exception:
+        return None
+
+
 def _gen_password(length: int) -> str:
     """生成随机密码（字母+数字）"""
     alphabet = string.ascii_letters + string.digits
@@ -219,6 +256,47 @@ class Bootstrap:
         return True
 
     # ---------------------- PostgreSQL ----------------------
+    def _has_postgres_process(self) -> bool:
+        """检查是否存在 postgres.exe 进程（无论是否监听端口）"""
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq postgres.exe"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return "postgres.exe" in (out.stdout or "")
+        except Exception:
+            return False
+
+    def _stop_postgres(self, pg_home: str, pg_data: str) -> None:
+        """停止残留的 postgres 进程（先优雅停止，再 taskkill 兜底）。
+
+        新电脑上残留的 postgres.exe 会持有 postmaster.pid，原因：Windows 上
+        直接 os.remove 该文件会因被占用而挂起，必须先把进程停掉才能删除。
+        """
+        pg_ctl = os.path.join(pg_home, "bin", "pg_ctl.exe")
+        _run([pg_ctl, "stop", "-D", pg_data, "-m", "immediate", "-t", "20"],
+             timeout=30, cwd=pg_home)
+        time.sleep(2)
+        if self._has_postgres_process():
+            logger.warning("[PostgreSQL] postgres 进程仍存在，尝试强制结束 ...")
+            _run(["taskkill", "/F", "/IM", "postgres.exe"], timeout=20)
+            time.sleep(2)
+
+    def _pid_file_is_stale(self, pid_file: str) -> bool | None:
+        """读取 postmaster.pid 首个 PID 判断是否残留。
+
+        True=已死(残留可清理) / False=仍在运行(不可清理) / None=无法判断
+        """
+        try:
+            with open(pid_file, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            if not lines:
+                return True
+            pid = int(lines[0].strip())
+        except Exception:
+            return None
+        return not _pid_alive(pid)
+
     def ensure_postgresql(self) -> bool:
         """确保 PostgreSQL 运行：检测端口 → pg_ctl status → pg_ctl start → 等待就绪"""
         pg_home = self.services.get("postgresql")
@@ -242,12 +320,13 @@ class Bootstrap:
         # 2. 检测 data 目录是否已初始化
         if not os.path.isfile(os.path.join(pg_data, "PG_VERSION")):
             logger.info("[PostgreSQL] data 目录未初始化，执行 initdb ...")
-            ret = subprocess.run(
+            ret = _run(
                 [initdb, "-D", pg_data, "-U", PG_SUPER_USER, "--auth=trust", "--encoding=UTF8"],
-                capture_output=True, text=True, cwd=pg_home
+                timeout=120, cwd=pg_home
             )
-            if ret.returncode != 0:
-                logger.error(f"[PostgreSQL] initdb 失败:\n{ret.stderr}")
+            if ret is None or ret.returncode != 0:
+                err = ret.stderr if ret is not None else ""
+                logger.error(f"[PostgreSQL] initdb 失败:\n{err}")
                 return False
             # 写入最小 pg_hba.conf（trust 模式，本地免密）
             with open(os.path.join(pg_data, "pg_hba.conf"), "w", encoding="utf-8") as f:
@@ -257,11 +336,11 @@ class Bootstrap:
             logger.info("[PostgreSQL] initdb 完成")
 
         # 3. 检查 pg_ctl status（区分"未运行"和"已在运行但端口未就绪"）
-        ret = subprocess.run(
+        ret = _run(
             [pg_ctl, "status", "-D", pg_data],
-            capture_output=True, text=True, cwd=pg_home
+            timeout=15, cwd=pg_home
         )
-        if ret.returncode == 0:
+        if ret is not None and ret.returncode == 0:
             # PG 进程存在但端口未就绪，等待恢复完成
             logger.info("[PostgreSQL] 进程存在，等待端口就绪 ...")
             if _wait_for_port("localhost", PG_PORT, timeout=30):
@@ -276,15 +355,33 @@ class Bootstrap:
         # 清理可能残留的 postmaster.pid
         pid_file = os.path.join(pg_data, "postmaster.pid")
         if os.path.isfile(pid_file):
-            logger.warning("[PostgreSQL] 清理残留 postmaster.pid ...")
-            os.remove(pid_file)
+            # 若仍有 postgres.exe 进程在跑，直接 os.remove 会在 Windows 上挂起（文件被占用），
+            # 必须先停止进程再删除（新电脑上多为残留进程）。
+            if self._has_postgres_process():
+                logger.warning("[PostgreSQL] 检测到残留 postgres 进程，先停止 ...")
+                self._stop_postgres(pg_home, pg_data)
+            stale = self._pid_file_is_stale(pid_file)
+            if stale is False:
+                logger.info("[PostgreSQL] postmaster.pid 对应进程仍在运行，跳过清理")
+            elif stale is None:
+                logger.warning("[PostgreSQL] 无法判断 postmaster.pid 是否残留，跳过清理")
+            else:
+                logger.warning("[PostgreSQL] 清理残留 postmaster.pid ...")
+                try:
+                    os.remove(pid_file)
+                except Exception as e:
+                    logger.warning(f"[PostgreSQL] 清理 postmaster.pid 失败(非致命): {e}")
 
-        ret = subprocess.run(
+        # 注意：pg_ctl start 会衍生出 postgres.exe 后台进程，若用 capture_output 捕获其 stdout/stderr，
+        # postgres 会继承管道并在 pg_ctl 退出后继续持有，导致 subprocess 等待 EOF 而永久挂起（Windows 经典问题）。
+        # 因此必须用 devnull 重定向输出（PG 日志已由 -l pg.log 记录到文件）。
+        ret = _run(
             [pg_ctl, "start", "-D", pg_data, "-l", pg_log, "-w", "-t", "30"],
-            capture_output=True, text=True, cwd=pg_home
+            timeout=40, cwd=pg_home, devnull=True
         )
-        if ret.returncode != 0:
-            logger.error(f"[PostgreSQL] 启动失败:\n{ret.stderr}")
+        if ret is None or ret.returncode != 0:
+            err = ret.stderr if ret is not None else ""
+            logger.error(f"[PostgreSQL] 启动失败:\n{err}")
             return False
 
         # 5. 等待就绪
@@ -308,40 +405,42 @@ class Bootstrap:
         env = os.environ.copy()
 
         # 创建 admin 角色（如果不存在）
-        ret = subprocess.run(
+        ret = _run(
             [psql, "-U", PG_SUPER_USER, "-d", "postgres", "-h", "localhost",
              "-tc", f"SELECT 1 FROM pg_roles WHERE rolname='{PG_USER}'"],
-            capture_output=True, text=True, env=env
+            timeout=15, env=env
         )
-        if "1" not in ret.stdout.strip():
+        if ret is not None and "1" not in ret.stdout.strip():
             logger.info(f"[PostgreSQL] 创建角色 {PG_USER} ...")
-            ret = subprocess.run(
+            ret = _run(
                 [psql, "-U", PG_SUPER_USER, "-d", "postgres", "-h", "localhost",
                  "-c", f"CREATE ROLE {PG_USER} WITH LOGIN SUPERUSER"],
-                capture_output=True, text=True, env=env
+                timeout=15, env=env
             )
-            if ret.returncode != 0:
-                logger.error(f"[PostgreSQL] 创建角色失败: {ret.stderr}")
+            if ret is None or ret.returncode != 0:
+                err = ret.stderr if ret is not None else ""
+                logger.error(f"[PostgreSQL] 创建角色失败: {err}")
             else:
                 logger.info(f"[PostgreSQL] 角色 {PG_USER} 已创建")
         else:
             logger.info(f"[PostgreSQL] 角色 {PG_USER} 已存在")
 
         # 创建 knowledge_base 数据库（如果不存在）
-        ret = subprocess.run(
+        ret = _run(
             [psql, "-U", PG_SUPER_USER, "-d", "postgres", "-h", "localhost",
              "-tc", f"SELECT 1 FROM pg_database WHERE datname='{PG_DB}'"],
-            capture_output=True, text=True, env=env
+            timeout=15, env=env
         )
-        if "1" not in ret.stdout.strip():
+        if ret is not None and "1" not in ret.stdout.strip():
             logger.info(f"[PostgreSQL] 创建数据库 {PG_DB} ...")
-            ret = subprocess.run(
+            ret = _run(
                 [psql, "-U", PG_SUPER_USER, "-d", "postgres", "-h", "localhost",
                  "-c", f"CREATE DATABASE {PG_DB} OWNER {PG_USER}"],
-                capture_output=True, text=True, env=env
+                timeout=15, env=env
             )
-            if ret.returncode != 0:
-                logger.error(f"[PostgreSQL] 创建数据库失败: {ret.stderr}")
+            if ret is None or ret.returncode != 0:
+                err = ret.stderr if ret is not None else ""
+                logger.error(f"[PostgreSQL] 创建数据库失败: {err}")
             else:
                 logger.info(f"[PostgreSQL] 数据库 {PG_DB} 已创建")
         else:

@@ -40,11 +40,14 @@ class ClassifyService:
 
     def _classify_one(self, chunk: Chunk, category_names: list[str],
                       categories) -> list[ChunkCategory]:
-        """对单个块分类"""
+        """对单个知识块分类（块已由分块器分段，超长文档天然分段提交）。
+
+        参考现有分类，允许一个块同时属于多个分类。
+        """
         prompt = (
-            f"请为以下知识片段选择最合适的分类（可多选），"
-            f"从以下分类中选择: {category_names}\n\n"
-            f"知识片段: {chunk.content[:500]}\n\n"
+            f"请对以下知识片段进行分类提取。可参考现有分类，允许多选（可同时属于多个分类）。\n"
+            f"现有分类: {category_names}\n\n"
+            f"知识片段: {chunk.content}\n\n"
             f"返回 JSON 格式: [{{\"category\": \"分类名\", \"confidence\": 0.95}}]"
         )
         try:
