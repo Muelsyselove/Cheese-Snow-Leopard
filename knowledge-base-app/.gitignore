@@ -14,6 +14,9 @@ build/
 venv/
 env/
 
+# 嵌入式 Python(start.bat 自动下载,不入库)
+.python/
+
 # 测试与覆盖率
 .pytest_cache/
 .coverage
