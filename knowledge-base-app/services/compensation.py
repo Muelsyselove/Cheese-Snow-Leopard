@@ -59,7 +59,16 @@ class CompensationReconciler:
     def _execute(self, task):
         """执行单个补偿任务。每个分支独立，单步失败不影响其他。"""
         if task.op_type == "delete_qdrant":
-            chunk_ids = task.target_id.split(",")
+            # 兼容两种格式：
+            # 新格式：target_id = doc_id，执行时先从 PG 解析 chunk_id 列表再删除
+            # 旧格式：target_id = "chunk_a,chunk_b,..."（历史遗留，直接按列表删除）
+            target = (task.target_id or "").strip()
+            if target.startswith("chunk_") or "chunk_" in target:
+                chunk_ids = target.split(",")
+            else:
+                doc_id = int(target)
+                chunk_ids = [f"chunk_{cid}"
+                             for cid in self.pg.list_chunk_ids(doc_id)]
             self.qdrant.delete(chunk_ids)
         elif task.op_type == "delete_pg_chunks":
             self.pg.delete_chunks_by_doc(int(task.target_id))

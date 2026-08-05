@@ -43,6 +43,9 @@ def run_web_ui(file_service=None, rag_service=None, lifecycle_service=None,
         pg_repo=pg_repo, startup_errors=startup_errors,
     )
 
+    # 无边框窗口的拖动/缩放均由前端 JS 经桥接(window_move / window_resize_drag)实现，
+    # 因此关闭 pywebview 自带的 easy_drag，避免其 window 级 mousedown 与手动拖动冲突、
+    # 或吞掉标题栏按钮的点击。
     index_path = os.path.join(STATIC_DIR, "index.html")
     window = webview.create_window(
         "知识学爆 Cheese Snow Leopard",
@@ -51,7 +54,8 @@ def run_web_ui(file_service=None, rag_service=None, lifecycle_service=None,
         width=1240, height=800,
         min_size=(960, 620),
         frameless=True,
-        easy_drag=True,
+        easy_drag=False,
+        zoomable=True,
         background_color="#0B0F1E",
         text_select=True,
     )

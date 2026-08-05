@@ -90,11 +90,13 @@ class RagService:
     """Agentic RAG 编排 + 混合检索"""
 
     def __init__(self, embedder: Embedder, llm: LLMClient,
-                 qdrant_store: VectorStore, config: dict):
+                 qdrant_store: VectorStore, config: dict,
+                 category_repo=None):
         self.embedder = embedder
         self.llm = llm
         self.qdrant = qdrant_store
         self.config = config
+        self.category_repo = category_repo
         self.last_hit_chunk_ids: list[int] = []  # 缓存最近一次检索命中 ID
         self.last_retrieved_chunks: set[str] = set()  # 最近一次流式查询的命中块 ID
 
@@ -128,6 +130,78 @@ class RagService:
         )
         self.last_hit_chunk_ids = [c.chunk_id for c in results]
         return results
+
+    # ---------------------------------------------------------- 目录遍历检索
+    def _category_tree(self):
+        """读取分类并构建 父→子 树。返回 (by_id, children_by_parent_id)。"""
+        cats = self.category_repo.list_all_categories() if self.category_repo else []
+        by_id = {c.category_id: c for c in cats}
+        children = {}
+        for c in cats:
+            children.setdefault(c.parent_id, []).append(c)
+        return by_id, children
+
+    def _pick_category_name(self, question: str, options: list[str], llm) -> str:
+        """让 LLM 从候选分类中挑选最贴近问题的一个（目录逐级下钻）。"""
+        if not options:
+            return ""
+        if len(options) == 1:
+            return options[0]
+        prompt = (
+            "你正在逐级浏览知识库分类目录。根据用户问题，从下列候选分类中选出"
+            "最贴切的一个分类名（只返回分类名本身，不要解释）：\n"
+            f"候选分类: {options}\n\n用户问题: {question}"
+        )
+        try:
+            used = llm or self.llm
+            # 目录下钻用非思考模式，快速选择
+            resp = used.chat([{"role": "user", "content": prompt}],
+                             thinking=False)
+            name = (resp.get("content", "") or "").strip().strip("\"'“”`")
+            for opt in options:
+                if name == opt or (opt in name):
+                    return opt
+            # 兜底：返回第一个候选项
+            return options[0]
+        except Exception as e:
+            logger.warning(f"目录下钻选择失败: {e}")
+            return options[0]
+
+    def navigate_category(self, question: str, llm=None) -> tuple[str, list[str]]:
+        """逐级下钻分类目录，返回 (最贴切分类名, 完整路径)。
+
+        流程：取一级目录 → 挑最相关 → 看其二级目录 → … 直到某目录无子目录
+        或 LLM 不再下钻。返回的叶子分类名用于过滤向量检索范围。
+        """
+        if self.category_repo is None:
+            return "", []
+        try:
+            by_id, children = self._category_tree()
+        except Exception as e:
+            logger.warning(f"读取分类树失败: {e}")
+            return "", []
+        if not children:
+            return "", []
+
+        node = None
+        path: list[str] = []
+        for _depth in range(8):
+            options = children.get(node.category_id if node else None, [])
+            if not options:
+                break
+            picked = self._pick_category_name(
+                question, [o.name for o in options], llm)
+            if not picked:
+                break
+            chosen = next((o for o in options if o.name == picked), options[0])
+            path.append(chosen.name)
+            node = chosen
+            # 若该目录无子目录，则已到最贴切层级
+            if node.category_id not in children:
+                break
+        if not path:
+            return "", []
+        return path[-1], path
 
     def query(self, user_question: str, history: list[dict] = None,
               llm=None) -> dict:
@@ -218,6 +292,7 @@ class RagService:
 
     def stream_query(self, user_question: str, history: list[dict] = None,
                      llm=None, thinking: bool = True,
+                     thinking_strength: str = "auto",
                      should_stop=None):
         """流式 RAG 查询（生成器）。
 
@@ -231,15 +306,26 @@ class RagService:
         Args:
             llm: 可选的 LLM 客户端覆盖
             thinking: 是否启用思考
+            thinking_strength: 部分思考模型的思维链强度（auto/low/medium/high）
             should_stop: 返回 True 则中断（用于手动停止）
         """
         used_llm = llm or self.llm
         from langchain_core.tools import tool
 
+        # 目录遍历：先逐级下钻到最贴近问题的分类，再在该分类范围内检索
+        leaf_category, category_path = self.navigate_category(
+            user_question, used_llm)
+        if leaf_category:
+            filters = {"categories": leaf_category}
+            yield ("step", {"op": "start", "kind": "navigate",
+                            "detail": "/".join(category_path)})
+        else:
+            filters = None
+
         @tool
         def knowledge_search(query: str) -> str:
             """搜索知识库相关内容"""
-            results = self.hybrid_search(query, top_k=20)
+            results = self.hybrid_search(query, top_k=20, filters=filters)
             formatted = []
             for chunk in results:
                 formatted.append(f"【chunk_{chunk.chunk_id}】{chunk.content}")
@@ -264,7 +350,8 @@ class RagService:
             full_content = ""
             for kind, text in used_llm.stream_chat(
                     raw, tools=[knowledge_search],
-                    thinking=thinking, should_stop=should_stop):
+                    thinking=thinking, thinking_strength=thinking_strength,
+                    should_stop=should_stop):
                 if kind == "tool_call":
                     data = json.loads(text)
                     idx = data.get("index", 0)

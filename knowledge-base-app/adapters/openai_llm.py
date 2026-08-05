@@ -35,36 +35,89 @@ class OpenAILLMClient:
         return self._client
 
     def chat(self, messages: list[dict],
-             tools: Optional[list] = None) -> dict:
-        """同步聊天，返回带 tool_calls 的响应。失败时指数退避重试。
+             tools: Optional[list] = None,
+             thinking: Optional[bool] = None) -> dict:
+        """同步聊天，返回带 tool_calls 的响应。失败时按参数退化重试。
 
         Args:
             tools: langchain BaseTool 列表或 OpenAI 工具字典列表。
                    langchain 工具会自动转换为 OpenAI 格式。
+            thinking: None=不特殊指定；True=显式思考；False=显式非思考。
+                      当模型不支持某些参数时会自动降级为更简请求重试。
         """
         client = self._get_client()
         last_err = None
         # 将 langchain BaseTool 转换为 OpenAI 工具格式
         openai_tools = self._convert_tools(tools) if tools else None
+        # 构造「由完整到最简」的请求变体，逐步去掉可能不被目标模型接受的参数。
+        # DeepSeek V4 等思考型模型在非思考模式下常拒绝 temperature / max_tokens /
+        # thinking 等字段，依次退化为仅 model + messages，保证调用最终成功。
+        variants = self._build_variants(messages, openai_tools, thinking)
+
         for attempt in range(self.max_retries):
-            try:
-                kwargs = {"model": self.model, "messages": messages,
-                          "temperature": self.temperature,
-                          "max_tokens": self.max_tokens}
-                if openai_tools:
-                    kwargs["tools"] = openai_tools
-                resp = client.chat.completions.create(**kwargs)
-                return {
-                    "content": resp.choices[0].message.content,
-                    "tool_calls": self._convert_tool_calls(resp.choices[0].message.tool_calls),
-                    "raw": resp
-                }
-            except Exception as e:
-                last_err = e
-                # 指数退避
-                wait = 2 ** attempt
-                time.sleep(wait)
+            for kwargs in variants:
+                try:
+                    resp = client.chat.completions.create(**kwargs)
+                    return {
+                        "content": resp.choices[0].message.content,
+                        "tool_calls": self._convert_tool_calls(resp.choices[0].message.tool_calls),
+                        "raw": resp
+                    }
+                except Exception as e:
+                    last_err = e
+            # 一轮变体全部失败，指数退避后重试
+            wait = 2 ** attempt
+            time.sleep(wait)
         raise LLMError(f"LLM 调用失败（重试 {self.max_retries} 次）: {last_err}") from last_err
+
+    def _build_variants(self, messages: list[dict],
+                        openai_tools: Optional[list],
+                        thinking: Optional[bool]) -> list[dict]:
+        """构造由完整到最简的请求参数变体。
+
+        用于应对各家模型对参数的不同约束——某个变体被拒绝时自动尝试去掉
+        thinking / temperature / max_tokens 的更简变体。
+        """
+        base: dict = {"model": self.model, "messages": messages}
+        if openai_tools:
+            base["tools"] = openai_tools
+
+        # 1) 完整请求
+        full = dict(base)
+        full["temperature"] = self.temperature
+        full["max_tokens"] = self.max_tokens
+        if thinking is not None:
+            full["extra_body"] = {
+                "thinking": {"type": "enabled" if thinking else "disabled"}}
+        variants = [full]
+
+        # 2) 去掉思考参数
+        v = dict(full)
+        v.pop("extra_body", None)
+        if v not in variants:
+            variants.append(v)
+
+        # 3) 再去掉温度
+        v = dict(full)
+        v.pop("extra_body", None)
+        v.pop("temperature", None)
+        if v not in variants:
+            variants.append(v)
+
+        # 4) 再去掉 max_tokens
+        v = dict(full)
+        v.pop("extra_body", None)
+        v.pop("temperature", None)
+        v.pop("max_tokens", None)
+        if v not in variants:
+            variants.append(v)
+
+        # 5) 仅保留 model + messages（+ tools）
+        v = dict(base)
+        if v not in variants:
+            variants.append(v)
+
+        return variants
 
     @staticmethod
     def _convert_tool_calls(tool_calls):
@@ -142,6 +195,7 @@ class OpenAILLMClient:
     def stream_chat(self, messages: list[dict],
                     tools: Optional[list] = None,
                     thinking: bool = True,
+                    thinking_strength: Optional[str] = "auto",
                     should_stop=None) -> Generator[tuple[str, str], None, None]:
         """流式聊天，逐 token 返回 (kind, text)。
 
@@ -150,6 +204,9 @@ class OpenAILLMClient:
           - "content"    正式回答内容
           - "tool_call"  text 为 JSON 字符串（工具调用增量）
         支持 should_stop 回调用于中途中断（返回 True 则停止）。
+
+        thinking_strength: 部分思考模型可调整思维链强度，
+            "auto"/"low"/"medium"/"high"（低/中/高）。auto 不传额外参数。
         """
         client = self._get_client()
         openai_tools = self._convert_tools(tools) if tools else None
@@ -163,7 +220,11 @@ class OpenAILLMClient:
         # 思考开关：仅当显式要求思考时传参（部分模型不支持，失败则忽略）
         if thinking:
             try:
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                body = {"thinking": {"type": "enabled"}}
+                if thinking_strength and thinking_strength != "auto":
+                    # 可思考模型支持调整思维链强度（reasoning_effort 为通用字段）
+                    body["reasoning_effort"] = thinking_strength
+                kwargs["extra_body"] = body
             except Exception:
                 pass
 

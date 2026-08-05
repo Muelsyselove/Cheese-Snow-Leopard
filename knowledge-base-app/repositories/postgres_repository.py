@@ -239,6 +239,37 @@ class PostgresRepository:
         rows = self._execute("SELECT COUNT(*) FROM chunk_index", fetch="all")
         return rows[0][0] if rows else 0
 
+    def list_random_chunks_by_category(self, category_ids: list[int],
+                                       limit: int) -> list[Chunk]:
+        """在指定分类集合内随机抽取知识块（随机知识卡片用，去重）"""
+        if not category_ids:
+            return []
+        # PG 限制：SELECT DISTINCT 的 ORDER BY 表达式必须出现在选择列表中，
+        # 故用子查询去重后再在外层 ORDER BY RANDOM()（语义与契约 SQL 等效）。
+        rows = self._execute(
+            """SELECT * FROM (
+                   SELECT DISTINCT c.chunk_id, c.content_hash, c.doc_id,
+                          c.doc_name, c.page_number, c.char_start, c.char_end,
+                          c.bbox, c.chunk_type, c.content, c.vector_id
+                   FROM chunk_index c
+                   JOIN chunk_category cc ON c.chunk_id = cc.chunk_id
+                   WHERE cc.category_id = ANY(%s)
+               ) t
+               ORDER BY RANDOM() LIMIT %s""",
+            (category_ids, limit), fetch="all"
+        )
+        return [self._row_to_chunk(r) for r in rows]
+
+    def list_random_chunks(self, limit: int) -> list[Chunk]:
+        """全库随机抽取知识块（随机知识卡片用）"""
+        rows = self._execute(
+            """SELECT chunk_id, content_hash, doc_id, doc_name, page_number,
+                      char_start, char_end, bbox, chunk_type, content, vector_id
+               FROM chunk_index ORDER BY RANDOM() LIMIT %s""",
+            (limit,), fetch="all"
+        )
+        return [self._row_to_chunk(r) for r in rows]
+
     def list_all_doc_ids(self) -> list[int]:
         """查询所有文档 ID（去重，升序）"""
         rows = self._execute(
@@ -295,6 +326,66 @@ class PostgresRepository:
             (category_id, name, parent_id, description)
         )
 
+    def find_category_by_path(self, path: list[str]) -> Optional[int]:
+        """沿 parent 链按名（lower）逐级查找分类路径，返回叶子 category_id。
+
+        任一级未命中返回 None。
+        """
+        parent_id = None
+        leaf_id = None
+        for name in path:
+            name = (name or "").strip()
+            if not name:
+                continue
+            if parent_id is None:
+                row = self._execute(
+                    """SELECT category_id FROM category
+                       WHERE parent_id IS NULL AND lower(name) = %s""",
+                    (name.lower(),), fetch="one"
+                )
+            else:
+                row = self._execute(
+                    """SELECT category_id FROM category
+                       WHERE parent_id = %s AND lower(name) = %s""",
+                    (parent_id, name.lower()), fetch="one"
+                )
+            if not row:
+                return None
+            leaf_id = row[0]
+            parent_id = row[0]
+        return leaf_id
+
+    def list_children(self, parent_id: Optional[int]) -> list[Category]:
+        """查询某父分类的直接子分类（parent_id 为 None 时查一级分类）"""
+        if parent_id is None:
+            rows = self._execute(
+                """SELECT c.category_id, c.name, c.parent_id, c.description,
+                          COUNT(cc.chunk_id) AS chunk_count
+                   FROM category c
+                   LEFT JOIN chunk_category cc
+                          ON c.category_id = cc.category_id
+                   WHERE c.parent_id IS NULL
+                   GROUP BY c.category_id, c.name, c.parent_id, c.description
+                   ORDER BY c.name""",
+                fetch="all"
+            )
+        else:
+            rows = self._execute(
+                """SELECT c.category_id, c.name, c.parent_id, c.description,
+                          COUNT(cc.chunk_id) AS chunk_count
+                   FROM category c
+                   LEFT JOIN chunk_category cc
+                          ON c.category_id = cc.category_id
+                   WHERE c.parent_id = %s
+                   GROUP BY c.category_id, c.name, c.parent_id, c.description
+                   ORDER BY c.name""",
+                (parent_id,), fetch="all"
+            )
+        return [Category(
+            category_id=r[0], name=r[1], parent_id=r[2],
+            description=r[3] or "", chunk_count=r[4]
+        ) for r in rows]
+
     # ========== chunk_category 关联表 ==========
 
     def upsert_chunk_categories(self, chunk_id: int,
@@ -329,6 +420,13 @@ class PostgresRepository:
             (chunk_id,), fetch="all"
         )
         return [r[0] for r in rows]
+
+    def count_chunk_category_links(self) -> int:
+        """统计知识条目总数（chunk_category 关联数，含多分类重复）"""
+        row = self._execute(
+            "SELECT COUNT(*) FROM chunk_category", fetch="one"
+        )
+        return row[0] if row else 0
 
     # ========== compensation_queue 表 ==========
 
@@ -380,6 +478,20 @@ class PostgresRepository:
         self._execute(
             "UPDATE compensation_queue SET retries = %s, updated_at = now() WHERE id = %s",
             (retries, task_id)
+        )
+
+    # ========== 全量清空（知识库重置） ==========
+
+    def clear_all_knowledge(self) -> None:
+        """清空全部知识数据（单事务 TRUNCATE）。
+
+        单条 TRUNCATE 多表在 PG 中为原子操作，自动处理外键顺序；
+        RESTART IDENTITY 重置自增序列，CASCADE 覆盖潜在依赖。
+        """
+        self._execute(
+            """TRUNCATE chunk_category, chunk_index, document_index,
+                      category, compensation_queue
+               RESTART IDENTITY CASCADE"""
         )
 
     # ========== 行映射工具方法 ==========

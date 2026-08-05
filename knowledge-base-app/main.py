@@ -123,7 +123,7 @@ def main():
             if embedder and llm and qdrant:
                 rag_service = RagService(
                     embedder=embedder, llm=llm, qdrant_store=qdrant,
-                    config=config.retrieval
+                    config=config.retrieval, category_repo=pg_repo
                 )
         except Exception as e:
             startup_errors.append(f"RAG 服务创建失败: {e}")
@@ -134,6 +134,11 @@ def main():
                 classify_service = ClassifyService(
                     llm=llm, category_repo=pg_repo, snowflake=snowflake
                 )
+            if classify_service is not None:
+                try:
+                    classify_service.ensure_preset_taxonomy()
+                except Exception as e:
+                    logger.warning(f"预置分类种子写入失败（非致命）: {e}")
         except Exception as e:
             startup_errors.append(f"分类服务创建失败: {e}")
             logger.error(f"分类服务创建失败: {e}", exc_info=True)

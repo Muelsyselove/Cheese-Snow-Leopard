@@ -111,13 +111,38 @@ class StructureAwareChunker(Chunker):
         self.counter = token_counter or CharTokenCounter()
 
     def split(self, parsed: ParsedDocument) -> list[Chunk]:
-        result: list[Chunk] = []
-        for src in parsed.chunks:
-            if src.chunk_type == "text":
-                result.extend(self._split_text_block(src))
-            else:
-                result.append(self._clone_block(src))
-        return result
+        if not parsed.chunks:
+            return []
+
+        # 按文档原始顺序把所有结构块拼接为单一文本流，再做整体结构感知分块。
+        # 解析阶段会把标题/公式/引出性短句切成彼此独立的粗粒度块，若逐块独立
+        # 处理，这些小块无法与上下文合并，就会产生「孤立标题 / 无上文公式 /
+        # 引出性文字」这类缺乏语境的碎片。合并后统一分块，让它们与上下文连贯组合。
+        blocks = sorted(
+            parsed.chunks,
+            key=lambda c: (c.char_start or 0, c.char_end or 0),
+        )
+        parts: list[str] = []
+        for i, blk in enumerate(blocks):
+            if i > 0:
+                parts.append("\n\n")
+            parts.append(blk.content)
+        full_text = "".join(parts)
+
+        first = blocks[0]
+        src = Chunk(
+            chunk_id=0,
+            content_hash="",
+            doc_id=first.doc_id,
+            doc_name=first.doc_name,
+            content=full_text,
+            chunk_type="text",
+            page_number=first.page_number,
+            char_start=0,
+            char_end=len(full_text),
+            bbox=first.bbox,
+        )
+        return self._split_text_block(src)
 
     def _split_text_block(self, src: Chunk) -> list[Chunk]:
         text = src.content
@@ -241,9 +266,10 @@ class StructureAwareChunker(Chunker):
         result: list[Chunk] = []
         current_spans: list[_Span] = []
         current_tokens = 0
+        current_has_body = False
         prev_block_text: Optional[str] = None
 
-        def make_chunk(spans_list: list[_Span]) -> Chunk:
+        def join_text(spans_list: list[_Span]) -> str:
             parts: list[str] = []
             for i, s in enumerate(spans_list):
                 if i == 0:
@@ -253,13 +279,15 @@ class StructureAwareChunker(Chunker):
                     sep = "" if s.start == prev.end else "\n"
                     parts.append(sep)
                     parts.append(s.text)
-            content = "".join(parts)
+            return "".join(parts)
+
+        def make_chunk(spans_list: list[_Span]) -> Chunk:
             return Chunk(
                 chunk_id=0,
                 content_hash="",
                 doc_id=src.doc_id,
                 doc_name=src.doc_name,
-                content=content,
+                content=join_text(spans_list),
                 chunk_type="text",
                 page_number=src.page_number,
                 char_start=spans_list[0].start,
@@ -278,38 +306,48 @@ class StructureAwareChunker(Chunker):
         for sp in spans:
             sp_tokens = self.counter.count(sp.text)
             is_heading = bool(self._HEADING_RE.match(sp.text.strip()))
+            is_body = not is_heading
 
-            if current_spans and (
-                is_heading
-                or current_tokens + sp_tokens > self.target_tokens
-            ):
+            # 仅在以下情况结束当前块：
+            # 1) 累积内容达到 target_tokens 上限；
+            # 2) 出现新标题且当前块已含正文（标题作为正文的语义前缀，避免孤立标题块）。
+            should_break = False
+            if current_spans:
+                if current_tokens + sp_tokens > self.target_tokens:
+                    should_break = True
+                elif is_heading and current_has_body:
+                    should_break = True
+
+            if should_break:
                 emit()
                 current_spans = []
                 current_tokens = 0
+                current_has_body = False
 
                 if prev_block_text and self.overlap_tokens > 0:
                     ov_span = self._take_overlap_span(prev_block_text, src)
                     if ov_span is not None:
                         current_spans.append(ov_span)
                         current_tokens = self.counter.count(ov_span.text)
+                        # 重叠片段不视为「正文」，避免紧跟其后的标题被过早截断为孤立标题块
 
             current_spans.append(sp)
             current_tokens += sp_tokens
+            if is_body:
+                current_has_body = True
 
         if current_spans:
-            if (current_tokens < self.min_chunk_tokens
+            if not current_has_body and result:
+                # 尾块仅含标题（无正文）→ 无条件并入上一块，避免孤立标题块
+                last = result[-1]
+                tail_text = join_text(current_spans)
+                sep = "" if (current_spans[0].start == last.char_end) else "\n"
+                last.content = last.content + sep + tail_text
+                last.char_end = current_spans[-1].end
+            elif (current_tokens < self.min_chunk_tokens
                     and result and prev_block_text is not None):
                 last = result[-1]
-                tail_parts: list[str] = []
-                for i, s in enumerate(current_spans):
-                    if i == 0:
-                        tail_parts.append(s.text)
-                    else:
-                        prev = current_spans[i - 1]
-                        sep = "" if s.start == prev.end else "\n"
-                        tail_parts.append(sep)
-                        tail_parts.append(s.text)
-                tail_text = "".join(tail_parts)
+                tail_text = join_text(current_spans)
                 sep = "" if (current_spans[0].start == last.char_end) else "\n"
                 last.content = last.content + sep + tail_text
                 last.char_end = current_spans[-1].end

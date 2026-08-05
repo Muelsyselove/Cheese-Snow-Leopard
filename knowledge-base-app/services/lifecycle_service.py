@@ -31,14 +31,16 @@ class LifecycleService:
         # 1. 标记 document_index.parse_status = 'deleting'（软删除起点）
         self.pg.update_parse_status(doc_id, "deleting")
         # 2. 入队清理任务（reconciler 逆序执行：Qdrant → PG → MinIO）
-        chunk_ids = self.pg.list_chunk_ids(doc_id)
-        chunk_id_strs = [f"chunk_{cid}" for cid in chunk_ids]
-        self.compensation.enqueue("delete_qdrant",
-                                  ",".join(chunk_id_strs))
+        # 注意：delete_qdrant 只存 doc_id，由 reconciler 执行时再解析 chunk_id 列表，
+        # 避免把全量 chunk_id 拼进 target_id（VARCHAR(100)）导致长度溢出。
+        self.compensation.enqueue("delete_qdrant", str(doc_id))
         self.compensation.enqueue("delete_pg_chunks", str(doc_id))  # 含 chunk_category 关联
         self.compensation.enqueue("delete_pg_doc", str(doc_id))
         file_path = self.pg.get_file_path(doc_id)
-        self.compensation.enqueue("delete_minio", file_path)
+        # 若文件路径缺失（如 document_index 记录已不存在），跳过 MinIO 清理，
+        # 避免把 null 写入 target_id 触发 NOT NULL 约束报错。
+        if file_path:
+            self.compensation.enqueue("delete_minio", file_path)
         logger.info(f"文档删除任务已入队 doc_id={doc_id}")
 
     def update_document(self, doc_id: int, new_file_path: str) -> int:
@@ -58,6 +60,34 @@ class LifecycleService:
         cid_str = f"chunk_{chunk_id}"
         self.qdrant.update_payload(cid_str, {"categories": cats})
         logger.info(f"分类变更已同步 chunk_id={cid_str}")
+
+    # ========== 知识库全量重置 ==========
+
+    def reset_all(self) -> bool:
+        """清空全部知识数据：PG 表 + Qdrant collection + 对象存储。
+
+        每步独立 try/except 记录日志，互不影响；任一步失败返回 False。
+        """
+        ok = True
+        try:
+            self.pg.clear_all_knowledge()
+            logger.info("PG 知识数据已清空")
+        except Exception as e:
+            ok = False
+            logger.error(f"PG 知识数据清空失败: {e}", exc_info=True)
+        try:
+            self.qdrant.drop_collection()
+            logger.info("Qdrant collection 已删除")
+        except Exception as e:
+            ok = False
+            logger.error(f"Qdrant collection 删除失败: {e}", exc_info=True)
+        try:
+            self.minio.clear()
+            logger.info("对象存储已清空")
+        except Exception as e:
+            ok = False
+            logger.error(f"对象存储清空失败: {e}", exc_info=True)
+        return ok
 
     # ========== 向量库重建（技术文档 11.3 问题7） ==========
 

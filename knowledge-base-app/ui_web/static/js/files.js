@@ -31,21 +31,25 @@ const FilesPage = {
     this.els.importBtn.onclick = () => this.importFiles();
     this.els.refreshBtn.onclick = () => this.load();
 
-    Bus.on("files", "documentsChanged", (docs) => {
-      this.docs = docs || [];
-      this.render();
-    });
-    Bus.on("files", "importProgress", (p) => {
-      this.els.progress.classList.remove("hidden");
-      this.els.bar.style.width = (p.percent || 0) + "%";
-      if (p.msg) setStatus(p.msg);
-    });
-    Bus.on("files", "importRunning", (b) => {
-      this.importing = !!b;
-      this.els.importBtn.disabled = !!b;
-      if (!b) setTimeout(() => { this.els.progress.classList.add("hidden"); this.els.bar.style.width = "0"; }, 600);
-    });
-    Bus.on("files", "importDone", () => this.load());
+    // 幂等守卫：防止 boot 重复执行导致 Bus 处理器重复注册
+    if (!this._eventsBound) {
+      this._eventsBound = true;
+      Bus.on("files", "documentsChanged", (docs) => {
+        this.docs = docs || [];
+        this.render();
+      });
+      Bus.on("files", "importProgress", (p) => {
+        this.els.progress.classList.remove("hidden");
+        this.els.bar.style.width = (p.percent || 0) + "%";
+        if (p.msg) setStatus(p.msg);
+      });
+      Bus.on("files", "importRunning", (b) => {
+        this.importing = !!b;
+        this.els.importBtn.disabled = !!b;
+        if (!b) setTimeout(() => { this.els.progress.classList.add("hidden"); this.els.bar.style.width = "0"; }, 600);
+      });
+      Bus.on("files", "importDone", () => this.load());
+    }
 
     this.refreshTexts();
     await this.load();
@@ -78,6 +82,15 @@ const FilesPage = {
     if (ok) await api("files_delete", doc.docId);
   },
 
+  async viewSource(doc) {
+    toast(t("files.opening"));
+    try {
+      await api("files_open_source", String(doc.docId));
+    } catch (e) {
+      toast(t("files.openFailed", { msg: (e && e.message) || String(e) }), true);
+    }
+  },
+
   statusBadge(status, statusKey) {
     const map = {
       completed: "badge-success", failed: "badge-danger",
@@ -101,6 +114,7 @@ const FilesPage = {
         <td>${this.statusBadge(d.status, d.statusKey)}</td>
         <td>${escapeHtml(d.pageCount || "—")}</td>
         <td class="text-right">
+          <button class="btn btn-sm" data-view="${d.docId}">${escapeHtml(t("files.view"))}</button>
           <button class="btn btn-sm btn-danger" data-del="${d.docId}">${escapeHtml(t("common.delete"))}</button>
         </td>
       </tr>`).join("");
@@ -111,6 +125,12 @@ const FilesPage = {
         <th class="col-num">${escapeHtml(t("files.col.pages"))}</th>
         <th class="col-actions"></th>
       </tr></thead><tbody>${rows}</tbody></table>`;
+    s.querySelectorAll("[data-view]").forEach((btn) => {
+      btn.onclick = () => {
+        const doc = this.docs.find((d) => String(d.docId) === btn.getAttribute("data-view"));
+        if (doc) this.viewSource(doc);
+      };
+    });
     s.querySelectorAll("[data-del]").forEach((btn) => {
       btn.onclick = () => {
         const doc = this.docs.find((d) => String(d.docId) === btn.getAttribute("data-del"));

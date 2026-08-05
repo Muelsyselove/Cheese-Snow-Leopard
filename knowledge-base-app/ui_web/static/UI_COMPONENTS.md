@@ -18,6 +18,8 @@
 8. [表格列宽](#8-表格列宽)
 9. [对话页专属组件](#9-对话页专属组件)
 10. [页面组装示例](#10-页面组装示例)
+11. [效果分级系统](#11-效果分级系统)
+12. [知识库仪表盘组件](#12-知识库仪表盘组件)
 
 ---
 
@@ -350,6 +352,161 @@ sec.innerHTML = `
       <option>English</option>
     </select>
   </div>`;
+```
+
+---
+
+## 11. 效果分级系统
+
+### 11.1 分级框架
+
+全站效果分三级，由 `QualityManager`（`js/quality.js`）自动检测并设置 `data-quality` 属性到 `<html>` 元素。
+
+| 档位 | data-quality | 能力 |
+|---|---|---|
+| Basic | `basic` | 纯 CSS 半透明 + 阴影，无背景动效，无 backdrop-filter |
+| High（默认） | `high` | backdrop-filter 玻璃 + 低流动背景 + 基础动效 |
+| Ultra | `ultra` | 增强 blur/saturate + 完整背景动效 + 弹性动效 |
+
+**驱动方式**：CSS 变量覆盖 + `:root[data-quality]` 选择器。JS 只负责检测和设置属性，不写死样式。
+
+**手动切换**：`localStorage.setItem('quality-preference', 'high')`，设为 `'auto'` 恢复自动检测。
+
+### 11.2 弹性缓动曲线
+
+| 变量 | 曲线 | 用途 |
+|---|---|---|
+| `--ease-elastic` | cubic-bezier(0.34, 1.56, 0.64, 1) | 回弹出现 |
+| `--ease-soft` | cubic-bezier(0.22, 1, 0.36, 1) | 常规过渡 |
+| `--ease-fluid` | cubic-bezier(0.4, 0, 0.2, 1) | 流体动画 |
+| `--ease-spring` | cubic-bezier(0.68, -0.55, 0.265, 1.55) | 弹簧物理 |
+
+### 11.3 动效工具类
+
+| 类名 | 效果 |
+|---|---|
+| `.animate-elastic-in` | 弹性缩放出现 |
+| `.animate-breathe` | 呼吸缩放（用于 AI 头像） |
+| `.animate-glow-pulse` | 发光脉冲 |
+
+### 11.4 发光输入容器 `.chat-input-wrap`
+
+包裹 textarea 的玻璃发光容器，聚焦时泛起强调色光晕。
+
+```html
+<div class="chat-input-wrap">
+  <textarea class="input chat-input" rows="1"></textarea>
+</div>
+```
+
+聚焦效果由 `:focus-within` 伪类驱动，无需 JS。
+
+### 11.5 AI 有机头像
+
+AI 消息头像带呼吸光晕效果：
+
+```html
+<div class="msg-avatar ai animate-breathe">🐆</div>
+```
+
+`animate-breathe` 类驱动 `breathe` keyframes 动画，配合 `::before` 伪元素的径向渐变光晕。
+
+### 11.6 消息弹性出现
+
+消息行使用 `elasticIn` 动画替代旧的 `msgIn`：
+
+```css
+.msg-row { animation: elasticIn 0.5s var(--ease-soft) forwards; }
+```
+
+---
+
+## 12. 知识库仪表盘组件
+
+> 知识库页（`js/knowledge.js`）专用：分类圆环 + 下钻详情 + 随机知识卡片条带。`.kn-dash` 加 `.drilled` 类进入下钻态（圆环收缩到左侧，详情展开，过渡 0.4s `var(--ease-soft)`）。
+
+### 12.1 仪表盘骨架
+
+```html
+<div class="kn-dash glass panel">          <!-- 仪表盘容器；.drilled = 下钻态 -->
+  <div class="kn-main">
+    <div class="kn-donut-wrap">…SVG…</div> <!-- 圆环区（下钻时收缩为 280px） -->
+    <div class="kn-detail">…</div>         <!-- 分类详情（未下钻时收起） -->
+  </div>
+  <div class="kn-cards-title">…</div>      <!-- “随机知识”标题行 -->
+  <div class="kn-cards">…</div>            <!-- 3 行卡片条带 -->
+</div>
+```
+
+### 12.2 圆环图
+
+| 类名 | 说明 |
+|------|------|
+| `.kn-donut` | SVG 圆环（弧段由 JS 用 stroke-dasharray 计算） |
+| `.kn-track` | 底圈轨道 |
+| `.kn-seg` | 分类弧段，颜色由 `.dc-*` 提供，选中加 `.sel` |
+| `.dc-1` ~ `.dc-8` | 8 个弧段配色（基于现有强调色变量，循环取色） |
+| `.kn-donut-center` / `.kn-total` / `.kn-total-label` | 中心总数与标签 |
+
+```html
+<svg class="kn-donut" viewBox="0 0 120 120">
+  <circle class="kn-track" cx="60" cy="60" r="46"/>
+  <circle class="kn-seg dc-1 sel" cx="60" cy="60" r="46"
+          stroke-dasharray="120 169" stroke-dashoffset="0"/>
+</svg>
+```
+
+### 12.3 下钻详情
+
+| 类名 | 说明 |
+|------|------|
+| `.kn-breadcrumb` / `.kn-crumb` / `.kn-crumb-sep` | 面包屑（`.cur` 为当前级，可点击回跳） |
+| `.kn-cat-name` / `.kn-cat-count` | 分类名 / 条目数 |
+| `.kn-chips` / `.kn-chip` / `.kn-chip-count` | 子分类 chips |
+
+```html
+<div class="kn-breadcrumb">
+  <span class="kn-crumb">全部</span><span class="kn-crumb-sep">/</span>
+  <span class="kn-crumb cur">技术</span>
+</div>
+<div class="kn-chips">
+  <button class="kn-chip">前端<span class="kn-chip-count">12</span></button>
+</div>
+```
+
+### 12.4 随机知识卡片
+
+| 类名 | 说明 |
+|------|------|
+| `.kn-cards-title` / `.kn-cards-label` | 标题行（含“换一批”按钮） |
+| `.kn-card-row` | 单行横向可滚动条带 |
+| `.kn-card` | 固定高圆角卡片（`.kn-card-text` 摘要 + `.kn-card-meta` 来源） |
+
+```html
+<div class="kn-card-row">
+  <div class="kn-card">
+    <div class="kn-card-text">知识内容摘要…</div>
+    <div class="kn-card-meta">report.pdf · 第 3 页</div>
+  </div>
+</div>
+```
+
+### 12.5 Markdown 渲染类（renderMarkdown）
+
+`app.js` 的 `renderMarkdown()` 输出以下语义化类，聊天气泡等场景通用：
+
+| 类名 | 说明 |
+|------|------|
+| `.md-pre` | 代码块（深色半透明底 + 等宽字体，`data-lang` 角标显示语言） |
+| `.md-code` | 行内代码 |
+| `.md-h1` ~ `.md-h4` | 标题 `#` ~ `####` |
+| `.md-ul` / `.md-ol` | 无序 / 有序列表 |
+| `.md-quote` | 引用 `>` |
+| `.md-link` | 链接（点击经 `api("open_external", url)` 打开） |
+| `.md-table` | 表格（`|a|b|` 形式） |
+
+```js
+bubble.innerHTML = renderMarkdown(text);
 ```
 
 ---

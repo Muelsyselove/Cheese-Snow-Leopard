@@ -118,6 +118,7 @@ class QdrantStore:
                 "chunk_type": chunk.chunk_type,
                 "content": chunk.content,
                 "categories": chunk.categories,
+                "category_paths": chunk.category_paths,
                 "bbox": chunk.bbox,
             }
             vector = {self.DENSE_NAME: emb.dense}
@@ -216,6 +217,20 @@ class QdrantStore:
         int_ids = [Chunk.parse_chunk_id_str(cid) for cid in chunk_ids]
         client.delete(collection_name=self.collection, points_selector=int_ids)
 
+    def drop_collection(self) -> None:
+        """删除整个 collection（知识库全量重置用）。
+
+        异常时仅告警不抛出；无论成功与否都将缓存的维度信息置空，
+        下次写入前由 ensure_collection 重建。
+        """
+        try:
+            client = self._get_client()
+            client.delete_collection(self.collection)
+            logger.info(f"Qdrant collection 已删除: {self.collection}")
+        except Exception as e:
+            logger.warning(f"Qdrant collection 删除失败（忽略）: {e}")
+        self._dim = None
+
     def update_payload(self, chunk_id: str, payload: dict) -> None:
         """更新单个 chunk 的 payload（如分类变更）"""
         client = self._get_client()
@@ -255,5 +270,6 @@ class QdrantStore:
             page_number=p.get("page_number"),
             bbox=p.get("bbox"),
             categories=p.get("categories", []),
+            category_paths=p.get("category_paths", []),
             vector_id=str(point.id)
         )

@@ -22,6 +22,7 @@ const SettingsPage = {
       </div>
       <div class="page-body settings-grid">
         <div class="glass panel" id="sec-language"></div>
+        <div class="glass panel" id="sec-appearance"></div>
         <div class="glass panel" id="sec-models"></div>
         <div class="glass panel" id="sec-defaults"></div>
         <div class="glass panel" id="sec-scheme"></div>
@@ -33,6 +34,7 @@ const SettingsPage = {
       </div>`;
     this.els = {
       language: document.getElementById("sec-language"),
+      appearance: document.getElementById("sec-appearance"),
       models: document.getElementById("sec-models"),
       defaults: document.getElementById("sec-defaults"),
       scheme: document.getElementById("sec-scheme"),
@@ -127,6 +129,7 @@ const SettingsPage = {
   renderAll() {
     if (!this.data) return;
     this.renderLanguage();
+    this.renderAppearance();
     this.renderModels();
     this.renderDefaults();
     this.renderScheme();
@@ -151,6 +154,146 @@ const SettingsPage = {
     this.els.language.querySelector("#lang-select").onchange = async (e) => {
       await api("i18n_set_language", e.target.value);
     };
+  },
+
+  // ---------------------------------------------------------- 外观（画质 + 主题）
+  renderAppearance() {
+    const qm = window.qualityManager;
+    const tm = window.themeManager;
+    const q = qm ? qm.getPreference() : "auto";
+    const themes = tm ? tm.list() : [];
+    const activeId = tm ? tm.active : "dark";
+    const cur = themes.find((x) => x.id === activeId);
+    const isCustom = !!(cur && !cur.builtin);
+    this.els.appearance.innerHTML = `
+      <div class="section-title">${escapeHtml(t("settings.appearance"))}</div>
+      <div class="section-hint">${escapeHtml(t("settings.appearanceHint"))}</div>
+      <div class="form-row">
+        <span class="form-label">${escapeHtml(t("settings.quality"))}</span>
+        <select id="quality-select" class="input">
+          ${["auto", "basic", "high", "ultra"].map((v) =>
+            `<option value="${v}" ${v === q ? "selected" : ""}>${escapeHtml(t("settings.quality." + v))}</option>`).join("")}
+        </select>
+      </div>
+      <div class="form-row">
+        <span class="form-label">${escapeHtml(t("settings.theme"))}</span>
+        <select id="theme-select" class="input">
+          ${themes.map((x) =>
+            `<option value="${escapeHtml(x.id)}" ${x.id === activeId ? "selected" : ""}>${escapeHtml(x.name)}</option>`).join("")}
+        </select>
+        <button id="theme-new" class="btn btn-sm">${escapeHtml(t("theme.new"))}</button>
+        ${isCustom ? `<button id="theme-edit" class="btn btn-sm">${escapeHtml(t("theme.edit"))}</button>` : ""}
+        ${isCustom ? `<button id="theme-del" class="btn btn-sm btn-danger">${escapeHtml(t("common.delete"))}</button>` : ""}
+      </div>
+      <div class="hint-xs">${escapeHtml(t("settings.themeHint"))}</div>`;
+    const sec = this.els.appearance;
+    sec.querySelector("#quality-select").onchange = (e) => {
+      if (qm) qm.setLevel(e.target.value);
+    };
+    sec.querySelector("#theme-select").onchange = (e) => {
+      if (tm) { tm.apply(e.target.value); this.renderAppearance(); }
+    };
+    sec.querySelector("#theme-new").onclick = () => this.openThemeEditor(null);
+    const editBtn = sec.querySelector("#theme-edit");
+    if (editBtn) editBtn.onclick = () => this.openThemeEditor(activeId);
+    const delBtn = sec.querySelector("#theme-del");
+    if (delBtn) delBtn.onclick = async () => {
+      const ok = await confirmDialog(t("theme.deleteConfirm"),
+        { danger: true, okLabel: t("common.delete") });
+      if (ok && tm) {
+        tm.remove(activeId);
+        toast(t("theme.deleted"));
+        this.renderAppearance();
+      }
+    };
+  },
+
+  // 主题编辑器：新建 / 编辑自定义主题（色板 + 高级 JSON 令牌覆盖）
+  openThemeEditor(editId) {
+    const tm = window.themeManager;
+    if (!tm) return;
+    const existing = editId ? tm.get(editId) : null;
+    const tokens0 = (existing && existing.tokens) || {};
+    const body = el("div");
+    const base0 = existing ? (existing.base || "dark") : "light";
+    body.innerHTML = `
+      <div class="form-row">
+        <span class="form-label">${escapeHtml(t("theme.name"))}</span>
+        <input id="th-name" class="input form-grow" value="${escapeHtml(existing ? existing.name : "")}"
+               placeholder="${escapeHtml(t("theme.namePlaceholder"))}">
+      </div>
+      <div class="form-row">
+        <span class="form-label">${escapeHtml(t("theme.base"))}</span>
+        <select id="th-base" class="input">
+          <option value="dark" ${base0 === "dark" ? "selected" : ""}>${escapeHtml(t("theme.dark"))}</option>
+          <option value="light" ${base0 === "light" ? "selected" : ""}>${escapeHtml(t("theme.light"))}</option>
+        </select>
+      </div>
+      <div class="theme-color-grid">
+        ${SettingsPage._themeColorFields.map((f) => `
+          <label class="theme-color-item">
+            <input type="color" id="thc-${f}" data-token="--${f}">
+            <span>${escapeHtml(t("theme.color." + f.replace(/-([a-z])/g, (_, c) => c.toUpperCase())))}</span>
+          </label>`).join("")}
+      </div>
+      <div class="hint-xs mb-s">${escapeHtml(t("theme.advancedHint"))}</div>
+      <textarea id="th-adv" class="input theme-adv" spellcheck="false"
+        placeholder='{"--glass-fill-top": "rgba(255,255,255,.5)"}'></textarea>`;
+    const baseSel = body.querySelector("#th-base");
+    const advTa = body.querySelector("#th-adv");
+    // 色板回填：编辑时优先用已存令牌，否则用所选基调的内置色板
+    const fillColors = (base) => {
+      const pal = SettingsPage._themePalettes[base] || SettingsPage._themePalettes.dark;
+      SettingsPage._themeColorFields.forEach((f) => {
+        const input = body.querySelector(`#thc-${f}`);
+        input.value = tokens0["--" + f] || pal[f];
+      });
+    };
+    fillColors(base0);
+    // 编辑时：色板之外的高级令牌回填到 JSON 区
+    if (existing) {
+      const extra = {};
+      for (const [k, v] of Object.entries(tokens0)) {
+        const key = k.startsWith("--") ? k.slice(2) : k;
+        if (!SettingsPage._themeColorFields.includes(key)) extra[k] = v;
+      }
+      if (Object.keys(extra).length) advTa.value = JSON.stringify(extra, null, 2);
+    }
+    baseSel.onchange = () => fillColors(baseSel.value);
+    openModal({
+      title: t(existing ? "theme.edit" : "theme.new"),
+      body, wide: true,
+      actions: [
+        { label: t("common.cancel") },
+        {
+          label: t("common.save"), primary: true,
+          onClick: (close) => {
+            const name = body.querySelector("#th-name").value.trim();
+            if (!name) { toast(t("theme.nameRequired"), true); return false; }
+            const tokens = {};
+            SettingsPage._themeColorFields.forEach((f) => {
+              tokens["--" + f] = body.querySelector(`#thc-${f}`).value;
+            });
+            const adv = advTa.value.trim();
+            if (adv) {
+              try {
+                const obj = JSON.parse(adv);
+                if (obj && typeof obj === "object") Object.assign(tokens, obj);
+              } catch (e) { toast(t("theme.invalidJson"), true); return false; }
+            }
+            const base = baseSel.value;
+            if (existing) {
+              tm.update(editId, { name, base, tokens });
+              tm.apply(editId);
+            } else {
+              tm.apply(tm.register({ name, base, tokens }));
+            }
+            toast(t("theme.saved"));
+            this.renderAppearance();
+          },
+        },
+      ],
+    });
   },
 
   // ---------------------------------------------------------- 模型配置
@@ -468,3 +611,24 @@ const SettingsPage = {
 };
 
 Pages.settings = SettingsPage;
+
+// ---------------------------------------------------------- 主题编辑器静态配置
+// 色板字段（编辑器中的 color input ↔ 设计令牌映射）
+SettingsPage._themeColorFields = [
+  "bg-top", "bg-mid", "bg-bottom",
+  "blob-cyan", "blob-violet", "blob-pink",
+  "accent", "accent-violet", "text-primary",
+];
+// 内置主题色板（编辑器默认值；与 app.css 中 :root / [data-theme="light"] 对齐）
+SettingsPage._themePalettes = {
+  dark: {
+    "bg-top": "#141B36", "bg-mid": "#0B0F1E", "bg-bottom": "#0F1531",
+    "blob-cyan": "#22D3EE", "blob-violet": "#8B5CF6", "blob-pink": "#EC4899",
+    "accent": "#22D3EE", "accent-violet": "#A78BFA", "text-primary": "#F2F5FF",
+  },
+  light: {
+    "bg-top": "#FBF7EE", "bg-mid": "#F6F1E5", "bg-bottom": "#EFE8D8",
+    "blob-cyan": "#7DD3FC", "blob-violet": "#C4B5FD", "blob-pink": "#F9A8D4",
+    "accent": "#0CA5C0", "accent-violet": "#8B7CF6", "text-primary": "#3A382F",
+  },
+};

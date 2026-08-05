@@ -31,12 +31,26 @@ import logging
 import os
 import threading
 
+from PySide6.QtCore import Qt
+
 logger = logging.getLogger(__name__)
 
 I18N_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "static", "i18n")
 LANGUAGES = {"zh_CN": "简体中文", "en_US": "English"}
 DEFAULT_LANGUAGE = "zh_CN"
+
+# 导入进度消息 → DB parse_status 映射（用于实时刷新文件状态徽章）
+# 与 services/file_service.py 中 import_document 的 _report 文案保持一致。
+_IMPORT_STAGE_MAP = {
+    "上传文件": "parsing",
+    "解析文档": "parsing",
+    "AI 分类": "classifying",
+    "向量化": "embedding",
+    "写入存储": "storing",
+    "写入向量库": "storing",
+    "完成": "completed",
+}
 
 
 # ============================================================
@@ -161,6 +175,14 @@ class WebBridge:
 
         self._select_default_model()
 
+        # 分类审批：AI 提议新分类时阻塞等待用户决定
+        self._approvals: dict[str, dict] = {}
+        self._approvals_lock = threading.Lock()
+        if self.file_service is not None and \
+                getattr(self.file_service, "classify", None) is not None:
+            self.file_service.classify.approval_hook = \
+                self._category_approval_hook
+
     # ---------------------------------------------------------- 基础
     def set_window(self, window):
         self._window = window
@@ -210,8 +232,85 @@ class WebBridge:
             logger.debug(f"最大化切换失败: {e}")
 
     def window_close(self):
+        # pywebview 的 Window 对象没有 close()，关闭入口是 destroy()
         if self._window is not None:
-            self._window.close()
+            self._window.destroy()
+
+    def window_move(self, dx: int, dy: int) -> dict:
+        """无边框窗口拖动（前端标题栏 mousedown/mousemove 调用）。
+
+        :param dx/dy: 相对上一次事件的自增屏幕像素位移（物理像素）。
+            前端每次 mousemove 发送“本次 vs 上次”的增量，而非自按下累计值，
+            避免累加时重复计入已发生位移。
+        """
+        form = getattr(self._window, "native", None)
+        if form is None:
+            return {}
+        try:
+            scale = getattr(form, "_scale", None) or 1.0
+            new_x = (form.Location.X + int(dx or 0)) / scale   # 逻辑像素
+            new_y = (form.Location.Y + int(dy or 0)) / scale
+            self._window.move(new_x, new_y)
+            return {"x": int(round(new_x)), "y": int(round(new_y))}
+        except Exception as e:
+            logger.debug(f"窗口移动失败: {e}")
+            return {}
+
+    def window_resize_drag(self, direction: str, dx: int, dy: int) -> dict:
+        """无边框窗口边缘/角落拖动缩放（前端 .rs-handle mousedown/mousemove 调用）。
+
+        :param direction: 'n'/'s'/'e'/'w'/'ne'/'nw'/'se'/'sw'
+        :param dx/dy: 相对上一次事件的自增屏幕像素位移（物理像素），
+            配合下方按当前宽高计算，避免位移重复累加。
+        :return: 缩放后的逻辑宽高。
+        """
+        form = getattr(self._window, "native", None)
+        if form is None:
+            return {}
+        try:
+            scale = getattr(form, "_scale", None) or 1.0
+            w = form.Width / scale                      # 逻辑像素
+            h = form.Height / scale
+            loc_x_p = form.Location.X                   # 物理像素
+            loc_y_p = form.Location.Y
+            dx = int(dx or 0)
+            dy = int(dy or 0)
+            d = (direction or "").lower()
+
+            new_w = w
+            new_h = h
+            move_x_p = loc_x_p
+            move_y_p = loc_y_p
+            if "e" in d:
+                new_w = w + dx / scale
+            if "w" in d:
+                new_w = w - dx / scale
+                move_x_p = loc_x_p + dx
+            if "s" in d:
+                new_h = h + dy / scale
+            if "n" in d:
+                new_h = h - dy / scale
+                move_y_p = loc_y_p + dy
+
+            # 最小尺寸钳制（物理像素）
+            min_w_p = form.MinimumSize.Width if hasattr(form, "MinimumSize") else 0
+            min_h_p = form.MinimumSize.Height if hasattr(form, "MinimumSize") else 0
+            new_w_p = max(int(round(new_w * scale)), min_w_p)
+            new_h_p = max(int(round(new_h * scale)), min_h_p)
+            # 西/北边被最小尺寸截断时，位置需回退以保持尺寸正确
+            if "w" in d:
+                move_x_p = loc_x_p + dx - (int(round(new_w * scale)) - new_w_p)
+            if "n" in d:
+                move_y_p = loc_y_p + dy - (int(round(new_h * scale)) - new_h_p)
+
+            if move_x_p != loc_x_p or move_y_p != loc_y_p:
+                self._window.move(move_x_p / scale, move_y_p / scale)
+            # 固定左上角（FixPoint.NORTH|WEST 默认值）缩放
+            self._window.resize(new_w_p / scale, new_h_p / scale)
+            return {"width": int(round(new_w)), "height": int(round(new_h))}
+        except Exception as e:
+            logger.debug(f"窗口缩放失败: {e}")
+            return {}
 
     def open_external(self, url: str):
         """在系统默认浏览器打开外部链接（仅用于申请 Key / 文档等显式外链）"""
@@ -372,7 +471,8 @@ class WebBridge:
                 "autoName": bool(conv.auto_name)}
 
     # ---------------------------------------------------------- 发送 / 中断
-    def chat_send(self, conv_id: int, text: str, thinking: bool) -> int:
+    def chat_send(self, conv_id: int, text: str, thinking: bool,
+                  thinking_strength: str = "auto") -> int:
         """发送消息（生成在后台线程进行，流式事件推送）。返回会话 ID。"""
         question = (text or "").strip()
         if not question:
@@ -410,7 +510,8 @@ class WebBridge:
         history = list(self._history)
         threading.Thread(
             target=self._chat_run,
-            args=(question, history, llm, bool(thinking)),
+            args=(question, history, llm, bool(thinking),
+                  (thinking_strength or "auto")),
             daemon=True,
         ).start()
         return self._current_conv_id or -1
@@ -430,17 +531,20 @@ class WebBridge:
 
     # ---- 流式执行（后台线程），步骤状态机镜像 old_v2 ChatBridge ----
     def _chat_run(self, question: str, history: list[dict], llm,
-                  thinking: bool):
+                  thinking: bool, thinking_strength: str = "auto"):
         answer = ""
         try:
             should_stop = lambda: self._interrupted  # noqa: E731
             if self.rag_service is not None:
                 stream = self.rag_service.stream_query(
                     question, history, llm=llm, thinking=thinking,
+                    thinking_strength=thinking_strength,
                     should_stop=should_stop)
             else:
                 stream = llm.stream_chat(
-                    history, thinking=thinking, should_stop=should_stop)
+                    history, thinking=thinking,
+                    thinking_strength=thinking_strength,
+                    should_stop=should_stop)
             for kind, text in stream:
                 if self._interrupted:
                     break
@@ -545,7 +649,8 @@ class WebBridge:
             rt = self.model_config_service.get_default_model_for_role(
                 "auto_naming")
             if rt:
-                api_base, model_name, api_key = rt
+                # get_model_runtime 返回顺序为 (api_base, api_key, model_name)
+                api_base, api_key, model_name = rt
                 from adapters.openai_llm import OpenAILLMClient
                 return OpenAILLMClient(
                     api_base=api_base, api_key=api_key, model=model_name,
@@ -588,7 +693,9 @@ class WebBridge:
                 f"用户：{user_msg[:200]}\n"
                 f"助手：{assistant_msg[:200]}"
             )
-            resp = llm.chat([{"role": "user", "content": prompt}])
+            # 自动命名一律使用非思考模式，避免推理模型耗时/报错；不支持时自动降级
+            resp = llm.chat([{"role": "user", "content": prompt}],
+                            thinking=False)
             title = (resp.get("content", "") or "").strip()
             title = title.strip("\"'“”‘’「」\n ")
             if not title:
@@ -613,6 +720,11 @@ class WebBridge:
         if conv.title and conv.title != self._tr("chat.newConversationTitle") \
                 and conv.title != "新对话":
             return
+        # 仅首次对话（第一条用户消息）时自动命名，之后不再自动重复触发
+        user_count = sum(1 for m in self.chat_store.list_messages(
+            self._current_conv_id) if m.role == "user")
+        if user_count != 1:
+            return
         self.chat_re_auto_name(self._current_conv_id)
 
     # ============================================================ 文件
@@ -628,7 +740,7 @@ class WebBridge:
         for d in docs:
             status = getattr(d, "parse_status", "completed") or "completed"
             result.append({
-                "docId": getattr(d, "doc_id", None) or -1,
+                "docId": str(getattr(d, "doc_id", None) or -1),
                 "fileName": getattr(d, "file_name", str(d)),
                 "status": status,
                 "statusKey": f"files.status.{status}",
@@ -675,12 +787,20 @@ class WebBridge:
                 base = int(i / total * 100) if total else 0
                 next_base = int((i + 1) / total * 100) if total else 100
                 span = max(next_base - base, 1)
+                # 可变容器：记录当前文件已上报的阶段，阶段变化时刷新状态徽章
+                last_stage = {"stage": None}
 
-                def _cb(pct, msg, base=base, span=span, path=path):
+                def _cb(pct, msg, base=base, span=span, path=path,
+                        last_stage=last_stage):
                     self._emit("files", "importProgress", {
                         "percent": base + int((pct / 100) * span),
                         "msg": f"{msg}: {path}",
                     })
+                    stage = self._import_stage_from_msg(msg)
+                    if stage and stage != last_stage["stage"]:
+                        last_stage["stage"] = stage
+                        self._emit("files", "documentsChanged",
+                                   self.files_list())
 
                 self._emit("files", "importProgress",
                            {"percent": base, "msg": f"正在导入: {path}"})
@@ -699,12 +819,24 @@ class WebBridge:
         self._emit("files", "importDone", results)
         self._status(self._tr("files.imported", count=results))
 
-    def files_delete(self, doc_id: int):
+    @staticmethod
+    def _import_stage_from_msg(msg: str) -> str | None:
+        """将导入进度消息映射为 DB parse_status，用于实时刷新状态徽章。"""
+        for key, stage in _IMPORT_STAGE_MAP.items():
+            if key in (msg or ""):
+                return stage
+        return None
+
+    def files_delete(self, doc_id):
+        # doc_id 为雪花算法 64 位整数，前端以字符串回传避免 JS 精度丢失
         if self.lifecycle_service is None:
             self._toast(self._tr("files.lifecycleNotReady"))
             return False
         try:
             self.lifecycle_service.delete_document(int(doc_id))
+            # 立即触发补偿清理，不等 reconciler 30 秒轮询
+            threading.Thread(target=self._compensation_run_once,
+                             daemon=True).start()
             self._status(self._tr("files.deleteQueued"))
             self._emit("files", "documentsChanged", self.files_list())
             return True
@@ -712,6 +844,102 @@ class WebBridge:
             logger.error(f"删除文档失败 doc_id={doc_id}: {e}", exc_info=True)
             self._toast(self._tr("files.deleteFailed", msg=e), is_error=True)
             return False
+
+    def _compensation_run_once(self):
+        try:
+            self.lifecycle_service.compensation.run_once()
+        except Exception as e:
+            logger.warning(f"补偿清理执行失败: {e}")
+        # 清理完成后再次刷新文件列表（delete 的实际清理由补偿执行）
+        self._emit("files", "documentsChanged", self.files_list())
+
+    def files_open_source(self, doc_id: str) -> bool:
+        """从 MinIO 下载源文件到临时目录并用系统默认程序打开"""
+        if self.pg_repo is None or self.file_service is None:
+            self._toast(self._tr("files.openFailed", msg="service not ready"),
+                        is_error=True)
+            return False
+        doc = self.pg_repo.get_document(int(doc_id))
+        if doc is None:
+            self._toast(self._tr("files.openFailed", msg="记录不存在"),
+                        is_error=True)
+            return False
+        try:
+            try:
+                from utils.paths import get_tmp_dir
+                tmp_dir = get_tmp_dir()
+            except Exception:
+                import tempfile
+                tmp_dir = tempfile.gettempdir()
+            local_path = os.path.join(tmp_dir, doc.file_name)
+            self.file_service.minio.download(doc.file_path, local_path)
+            os.startfile(local_path)  # Windows
+            self._status(self._tr("files.opening"))
+            return True
+        except Exception as e:
+            logger.error(f"打开源文件失败 doc_id={doc_id}: {e}", exc_info=True)
+            self._toast(self._tr("files.openFailed", msg=e), is_error=True)
+            return False
+
+    # ---------------------------------------------------------- 分类审批
+    def _category_approval_hook(self, suggested_path, content_preview,
+                                doc_name):
+        """ClassifyService 的 approval_hook：推送审批弹窗并阻塞等待用户决定
+        （180s 超时归入未分类）。返回非空路径列表 = 使用该路径；None = 未分类。"""
+        import uuid
+        req_id = uuid.uuid4().hex
+        entry = {"event": threading.Event(), "path": None}
+        with self._approvals_lock:
+            self._approvals[req_id] = entry
+        self._emit("files", "categoryApproval", {
+            "requestId": req_id,
+            "suggestedPath": [str(p) for p in (suggested_path or [])],
+            "preview": (content_preview or "")[:200],
+            "docName": doc_name or "",
+            "tree": self._existing_category_paths(),
+        })
+        entry["event"].wait(timeout=180)
+        with self._approvals_lock:
+            self._approvals.pop(req_id, None)
+        if entry.get("allow"):
+            return [str(p) for p in (suggested_path or [])]
+        return entry["path"] if entry["path"] else None
+
+    def _existing_category_paths(self) -> list[list[str]]:
+        """全部现有分类的完整路径（供审批弹窗选择现有分类）"""
+        if self.pg_repo is None:
+            return []
+        try:
+            cats = self.pg_repo.list_all_categories()
+        except Exception:
+            return []
+        by_id = {c.category_id: c for c in cats}
+        paths = []
+        for c in cats:
+            chain, node, seen = [], c, set()
+            while node is not None and node.category_id not in seen:
+                seen.add(node.category_id)
+                chain.append(node.name)
+                node = by_id.get(node.parent_id)
+            paths.append(list(reversed(chain)))
+        return paths
+
+    def files_resolve_category(self, request_id: str, action: str, path=None):
+        """前端审批回调。action: allow(用建议路径) / choose(选择现有) /
+        custom(自建) / other(归入未分类)"""
+        with self._approvals_lock:
+            entry = self._approvals.get(str(request_id))
+        if entry is None:
+            return False
+        if action == "allow":
+            entry["path"] = None  # None 表示沿用建议路径（由 hook 返回建议值）
+            entry["allow"] = True
+        elif action in ("choose", "custom") and path:
+            entry["path"] = [str(p) for p in path if str(p).strip()]
+        else:
+            entry["path"] = []
+        entry["event"].set()
+        return True
 
     # ============================================================ 知识库
     def knowledge_list(self) -> list[dict]:
@@ -740,13 +968,18 @@ class WebBridge:
             return False
 
         # 信号 → 事件（直连闭包，在 worker 线程同步回调）
+        # 注意：worker 由 threading.Thread 调用 run()（非 QThread.start()），
+        # 无 Qt 事件循环，必须显式 Qt.DirectConnection，否则 AutoConnection
+        # 会走 queued 投递而永不执行，导致 UI 卡在"正在重建"。
         worker.progress.connect(
             lambda pct, msg: (self._emit("knowledge", "rebuildProgress",
                                          {"percent": pct, "msg": msg}),
-                              self._status(f"{msg} ({pct}%)")))
-        worker.finished.connect(self._on_rebuild_done)
+                              self._status(f"{msg} ({pct}%)")),
+            Qt.DirectConnection)
+        worker.finished.connect(self._on_rebuild_done, Qt.DirectConnection)
         worker.error.connect(
-            lambda msg: self._toast(msg, is_error=True))
+            lambda msg: self._toast(msg, is_error=True),
+            Qt.DirectConnection)
         self._rebuilding = True
         self._emit("knowledge", "rebuilding", True)
         self._status(self._tr("knowledge.rebuildStarted"))
@@ -761,6 +994,99 @@ class WebBridge:
         self._emit("knowledge", "categoriesChanged", self.knowledge_list())
         self._status(self._tr("knowledge.rebuildDone") if success
                      else self._tr("knowledge.rebuildFailed"))
+
+    # ---------------------------------------------------------- 知识库仪表盘
+    def knowledge_dashboard(self) -> dict:
+        """返回 {total: int, tree: [...]}。tree 为嵌套结构：
+        [{id: str, name: str, count: int(含后代), children: [...]}]
+        total = chunk_category 关联总数（含多分类重复）"""
+        if self.pg_repo is None:
+            return {"total": 0, "tree": []}
+        try:
+            cats = self.pg_repo.list_all_categories()
+        except Exception as e:
+            logger.warning(f"加载分类失败: {e}")
+            return {"total": 0, "tree": []}
+        try:
+            total = int(self.pg_repo.count_chunk_category_links())
+        except Exception:
+            total = 0
+
+        nodes = {}
+        children_map: dict[int, list] = {}
+        for c in cats:
+            cid = c.category_id
+            nodes[cid] = {"id": str(cid), "name": c.name,
+                          "count": int(getattr(c, "chunk_count", 0) or 0),
+                          "children": []}
+            children_map.setdefault(c.parent_id, []).append(cid)
+
+        def _sum(cid: int) -> int:
+            node = nodes[cid]
+            for child_id in children_map.get(cid, []):
+                node["count"] += _sum(child_id)
+                node["children"].append(nodes[child_id])
+            return node["count"]
+
+        tree = []
+        root_ids = [c.category_id for c in cats
+                    if not c.parent_id or c.parent_id not in nodes]
+        for cid in root_ids:
+            _sum(cid)
+            tree.append(nodes[cid])
+        return {"total": total, "tree": tree}
+
+    def knowledge_random_chunks(self, category_id: str = "",
+                                limit: int = 12) -> list[dict]:
+        """随机知识卡片。category_id 为空串/"0" 时全库随机；否则含全部后代分类。
+        返回 [{docName, content, page}]，content 截断到 300 字。"""
+        if self.pg_repo is None:
+            return []
+        try:
+            cid_str = str(category_id or "").strip()
+            if cid_str and cid_str != "0":
+                cats = self.pg_repo.list_all_categories()
+                children_map: dict[int, list] = {}
+                for c in cats:
+                    children_map.setdefault(c.parent_id, []).append(
+                        c.category_id)
+                root = int(cid_str)
+                ids, stack = [], [root]
+                while stack:
+                    cur = stack.pop()
+                    ids.append(cur)
+                    stack.extend(children_map.get(cur, []))
+                chunks = self.pg_repo.list_random_chunks_by_category(
+                    ids, int(limit))
+            else:
+                chunks = self.pg_repo.list_random_chunks(int(limit))
+        except Exception as e:
+            logger.warning(f"随机知识卡片查询失败: {e}")
+            return []
+        return [{"docName": getattr(ch, "doc_name", "") or "",
+                 "content": (getattr(ch, "content", "") or "")[:300],
+                 "page": getattr(ch, "page_number", None)}
+                for ch in chunks]
+
+    def knowledge_reset_all(self) -> bool:
+        """全量清空知识库并重建预置分类"""
+        if self.lifecycle_service is None:
+            self._toast(self._tr("knowledge.lifecycleNotReady"))
+            return False
+        try:
+            self.lifecycle_service.reset_all()
+            if self.file_service is not None and \
+                    getattr(self.file_service, "classify", None) is not None:
+                self.file_service.classify.ensure_preset_taxonomy()
+            self._toast(self._tr("knowledge.resetDone"))
+            self._emit("knowledge", "categoriesChanged", [])
+            self._emit("files", "documentsChanged", self.files_list())
+            return True
+        except Exception as e:
+            logger.error(f"知识库全量重置失败: {e}", exc_info=True)
+            self._toast(self._tr("knowledge.resetFailed", msg=e),
+                        is_error=True)
+            return False
 
     # ============================================================ 设置
     def _load_config(self) -> dict:
@@ -1158,8 +1484,9 @@ class WebBridge:
         worker = DependencyService().create_install_worker(keys,
                                                            install=install)
         worker.progress.connect(
-            lambda line: self._emit("settings", "depLog", line))
-        worker.finished.connect(self._on_dep_done)
+            lambda line: self._emit("settings", "depLog", line),
+            Qt.DirectConnection)
+        worker.finished.connect(self._on_dep_done, Qt.DirectConnection)
         self._dep_running = True
         self._emit("settings", "depRunning", True)
         threading.Thread(target=worker.run, daemon=True).start()

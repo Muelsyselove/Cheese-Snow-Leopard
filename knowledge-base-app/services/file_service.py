@@ -117,8 +117,8 @@ class FileService:
                 self.qdrant.upsert(chunks, embeddings)
             except Exception as qe:
                 self.compensation.enqueue("delete_pg_chunks", str(doc_id))
-                self.compensation.enqueue("upsert_qdrant",
-                                          ",".join(c.chunk_id_str for c in chunks))
+                # 只存 doc_id，避免把全量 chunk_id 拼进 target_id(VARCHAR(100))溢出
+                self.compensation.enqueue("upsert_qdrant", str(doc_id))
                 raise StorageError(f"Qdrant 写入失败，已入补偿队列: {qe}") from qe
 
             # 阶段 7: 完成
@@ -283,8 +283,8 @@ class FileService:
                 self.qdrant.upsert(chunks, embeddings)
             except Exception as qe:
                 self.compensation.enqueue("delete_pg_chunks", str(doc_id))
-                self.compensation.enqueue("upsert_qdrant",
-                                          ",".join(c.chunk_id_str for c in chunks))
+                # 只存 doc_id，避免把全量 chunk_id 拼进 target_id(VARCHAR(100))溢出
+                self.compensation.enqueue("upsert_qdrant", str(doc_id))
                 raise StorageError(f"Qdrant 写入失败，已入补偿队列: {qe}") from qe
 
             # 阶段 7: 完成

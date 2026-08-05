@@ -15,8 +15,9 @@
   </div>
 
   <div id="app">
-    <!-- 标题栏（frameless 自绘） -->
-    <header id="titlebar" class="drag-region">
+    <!-- 标题栏（frameless 自绘；拖动由 app.js initWindowDrag 经桥接实现，故不使用 pywebview 的 drag-region，
+         避免其 body 级 mousedown 拦截标题栏按钮区域的点击） -->
+    <header id="titlebar">
       <div class="tb-left">
         <span class="tb-logo">🐆</span>
         <span class="tb-title" data-i18n="app.title">知识学爆 Cheese Snow Leopard</span>
@@ -74,12 +75,26 @@
     </footer>
   </div>
 
+  <!-- 无边框窗口缩放热区（拖动边缘/角落调整窗口大小） -->
+  <div id="resize-edge" aria-hidden="true">
+    <div class="rs-handle rs-n" data-dir="n"></div>
+    <div class="rs-handle rs-s" data-dir="s"></div>
+    <div class="rs-handle rs-e" data-dir="e"></div>
+    <div class="rs-handle rs-w" data-dir="w"></div>
+    <div class="rs-handle rs-ne" data-dir="ne"></div>
+    <div class="rs-handle rs-nw" data-dir="nw"></div>
+    <div class="rs-handle rs-se" data-dir="se"></div>
+    <div class="rs-handle rs-sw" data-dir="sw"></div>
+  </div>
+
   <!-- Toast -->
   <div id="toast" class="glass" role="status"></div>
 
   <!-- 模态对话框挂载点 -->
   <div id="modal-root"></div>
 
+  <script src="js/quality.js"></script>
+  <script src="js/theme.js"></script>
   <script src="js/app.js"></script>
   <script src="js/chat.js"></script>
   <script src="js/files.js"></script>

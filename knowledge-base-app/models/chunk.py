@@ -23,7 +23,8 @@ class Chunk:
     char_end: Optional[int] = None                  # 字符结束偏移
     bbox: Optional[list[float]] = None              # 页面坐标框 [x, y, w, h]
     vector_id: Optional[str] = None                 # 向量库中的对应ID
-    categories: list[str] = field(default_factory=list)  # 所属分类名称列表（从 chunk_category 表读取）
+    categories: list[str] = field(default_factory=list)  # 所属分类名称（含祖先，扁平，用于过滤）
+    category_paths: list[list[str]] = field(default_factory=list)  # 所属分类完整层级路径
     created_at: Optional[str] = None                # 创建时间
 
     @property

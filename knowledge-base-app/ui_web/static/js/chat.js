@@ -10,6 +10,7 @@ const ChatPage = {
   currentModel: null,
   generating: false,
   thinking: true,
+  thinkingStrength: "auto",
   hasRag: false,
   messages: [],          // [{role, content}] 已完成消息
   stream: null,          // 当前流式气泡引用
@@ -27,11 +28,14 @@ const ChatPage = {
         <div class="chat-toolbar">
           <button id="model-btn" class="btn model-btn"></button>
           <button id="thinking-toggle" class="pill-toggle"></button>
+          <select id="thinking-strength" class="strength-select hidden" title="${escapeHtml(t("chat.thinkingStrengthTip"))}"></select>
           <div class="toolbar-spacer"></div>
         </div>
         <div class="chat-scroll" id="chat-scroll"></div>
         <div class="chat-input-row">
-          <textarea id="chat-input" class="input chat-input" rows="1"></textarea>
+          <div class="chat-input-wrap">
+            <textarea id="chat-input" class="input chat-input" rows="1"></textarea>
+          </div>
           <button id="chat-send" class="btn btn-primary"></button>
           <button id="chat-stop" class="btn btn-danger hidden"></button>
         </div>
@@ -44,6 +48,7 @@ const ChatPage = {
       stop: document.getElementById("chat-stop"),
       modelBtn: document.getElementById("model-btn"),
       thinkToggle: document.getElementById("thinking-toggle"),
+      strengthSel: document.getElementById("thinking-strength"),
       newConv: document.getElementById("conv-new"),
     };
     this.els.newConv.onclick = () => this.newConversation();
@@ -54,6 +59,13 @@ const ChatPage = {
       this.thinking = !this.thinking;
       this.renderThinkingToggle();
     };
+    this.els.strengthSel.onchange = () => {
+      this.thinkingStrength = this.els.strengthSel.value || "auto";
+    };
+    // 填充思维链强度选项
+    this.els.strengthSel.innerHTML = ["auto", "low", "medium", "high"]
+      .map((v) => `<option value="${v}">${t("chat.strength." + v)}</option>`)
+      .join("");
     this.els.input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
@@ -110,6 +122,9 @@ const ChatPage = {
 
   // ---------------------------------------------------------- 事件绑定
   bindEvents() {
+    // 幂等守卫：防止 boot 重复执行导致 Bus 处理器重复注册（消息/流式重复）
+    if (this._eventsBound) return;
+    this._eventsBound = true;
     Bus.on("chat", "conversationsChanged", (list) => {
       this.conversations = list || [];
       this.renderConvList();
@@ -267,6 +282,11 @@ const ChatPage = {
     b.classList.toggle("on", this.thinking);
     b.textContent = "💭 " + t("chat.thinkingMode");
     b.title = t("chat.thinkingTip");
+    // 仅开启思考时显示思维链强度选择器
+    if (this.els.strengthSel) {
+      this.els.strengthSel.classList.toggle("hidden", !this.thinking);
+      this.els.strengthSel.value = this.thinkingStrength || "auto";
+    }
   },
 
   renderGenerating() {
@@ -319,15 +339,15 @@ const ChatPage = {
     const row = el("div", "msg-row user");
     row.innerHTML = `
       <div class="msg-avatar user">🙂</div>
-      <div class="msg-body"><div class="bubble">${mdLite(text)}</div></div>`;
+      <div class="msg-body"><div class="bubble">${renderMarkdown(text)}</div></div>`;
     this.els.scroll.appendChild(row);
   },
 
   appendAssistantStatic(text) {
     const row = el("div", "msg-row ai");
     row.innerHTML = `
-      <div class="msg-avatar ai">🐆</div>
-      <div class="msg-body"><div class="bubble">${mdLite(text)}</div></div>`;
+      <div class="msg-avatar ai animate-breathe">🐆</div>
+      <div class="msg-body"><div class="bubble">${renderMarkdown(text)}</div></div>`;
     this.els.scroll.appendChild(row);
   },
 
@@ -336,7 +356,7 @@ const ChatPage = {
     this.clearEmpty();
     const row = el("div", "msg-row ai");
     row.innerHTML = `
-      <div class="msg-avatar ai">🐆</div>
+      <div class="msg-avatar ai animate-breathe">🐆</div>
       <div class="msg-body">
         <div class="steps hidden"></div>
         <div class="thinking-box hidden">
@@ -380,7 +400,7 @@ const ChatPage = {
     st.answerText += text;
     if (st.typing) st.typing.remove();
     st.typing = null;
-    st.answer.innerHTML = mdLite(st.answerText);
+    st.answer.innerHTML = renderMarkdown(st.answerText);
     this.scrollBottom();
   },
 
@@ -429,7 +449,7 @@ const ChatPage = {
       this.clearEmpty();
       const row = el("div", "msg-row ai");
       row.innerHTML = `
-        <div class="msg-avatar ai">🐆</div>
+        <div class="msg-avatar ai animate-breathe">🐆</div>
         <div class="msg-body"><div class="bubble"><span class="text-danger">${escapeHtml(msg)}</span></div></div>`;
       this.els.scroll.appendChild(row);
       this.scrollBottom(true);
@@ -457,7 +477,8 @@ const ChatPage = {
     }
     this.els.input.value = "";
     this.els.input.style.height = "auto";
-    const id = await api("chat_send", this.convId, text, this.thinking);
+    const id = await api("chat_send", this.convId, text, this.thinking,
+      this.thinkingStrength);
     if (id > 0 && id !== this.convId) {
       this.convId = id;
       this.renderConvList();

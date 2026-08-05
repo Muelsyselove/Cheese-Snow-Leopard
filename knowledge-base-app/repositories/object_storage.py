@@ -139,6 +139,19 @@ class MinioRepository(ObjectStorage):
                 return False
             raise StorageError(f"MinIO 存在性检查失败 {object_key}: {e}") from e
 
+    def clear(self) -> None:
+        """清空 bucket 内全部对象（知识库全量重置用）。异常仅告警不抛出。"""
+        try:
+            client = self._get_client()
+            for obj in client.list_objects(self.bucket, recursive=True):
+                try:
+                    client.remove_object(self.bucket, obj.object_name)
+                except Exception as e:
+                    logger.warning(f"MinIO 删除对象失败 {obj.object_name}: {e}")
+            logger.info(f"MinIO bucket 已清空: {self.bucket}")
+        except Exception as e:
+            logger.warning(f"MinIO 清空失败（忽略）: {e}")
+
     @staticmethod
     def _generate_object_key(local_path: str) -> str:
         file_name = os.path.basename(local_path) or "file"
@@ -210,6 +223,22 @@ class LocalFSAdapter(ObjectStorage):
     def exists(self, object_key: str) -> bool:
         full = self._full_path(object_key)
         return os.path.exists(full)
+
+    def clear(self) -> None:
+        """清空 root 下所有子项（保留 root 目录本身）。异常仅告警不抛出。"""
+        try:
+            for entry in os.listdir(self.root):
+                full = os.path.join(self.root, entry)
+                try:
+                    if os.path.isfile(full) or os.path.islink(full):
+                        os.remove(full)
+                    else:
+                        shutil.rmtree(full)
+                except OSError as e:
+                    logger.warning(f"本地文件系统删除失败 {full}: {e}")
+            logger.info(f"本地文件系统存储已清空: {self.root}")
+        except OSError as e:
+            logger.warning(f"本地文件系统清空失败（忽略）: {e}")
 
     @staticmethod
     def _generate_object_key(local_path: str) -> str:

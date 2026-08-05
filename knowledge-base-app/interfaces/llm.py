@@ -15,6 +15,7 @@ class LLMClient(Protocol):
     def stream_chat(self, messages: list[dict],
                     tools: list | None = None,
                     thinking: bool = True,
+                    thinking_strength: str | None = "auto",
                     should_stop=None) -> Generator[tuple[str, str], None, None]:
         """流式聊天，逐 token 返回 (kind, text)。
 
@@ -22,5 +23,7 @@ class LLMClient(Protocol):
           - "reasoning"  思考过程（reasoning_content）
           - "content"    正式回答内容
           - "tool_call"  text 为 JSON 字符串（工具调用增量）
+
+        thinking_strength: 部分思考模型的思维链强度（auto/low/medium/high）。
         """
         ...
