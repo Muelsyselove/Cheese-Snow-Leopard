@@ -2,15 +2,16 @@
 
 表结构：
     conversations: id, title, model, created_at, updated_at
-    messages: id, conversation_id, role, content, created_at
+    messages: id, conversation_id, role, content, meta, created_at
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ class Message:
     conversation_id: int
     role: str          # user / assistant / system
     content: str
+    meta: dict = field(default_factory=dict)   # 思考链/引用等附加元数据
     created_at: float = 0.0
 
 
@@ -72,19 +74,27 @@ class ChatStore:
                     conversation_id INTEGER NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    meta TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL,
                     FOREIGN KEY (conversation_id) REFERENCES conversations(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_conv
                     ON messages(conversation_id);
             """)
-            # 迁移：老库补充 auto_name 列
+            # 迁移：老库补充 auto_name / meta 列
             cols = [r[1] for r in conn.execute(
                 "PRAGMA table_info(conversations)").fetchall()]
             if "auto_name" not in cols:
                 conn.execute(
                     "ALTER TABLE conversations "
                     "ADD COLUMN auto_name INTEGER NOT NULL DEFAULT 1"
+                )
+            mcols = [r[1] for r in conn.execute(
+                "PRAGMA table_info(messages)").fetchall()]
+            if "meta" not in mcols:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN meta TEXT "
+                    "NOT NULL DEFAULT '{}'"
                 )
 
     # ---------------------------------------------------------- 对话
@@ -157,13 +167,15 @@ class ChatStore:
             conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
     # ---------------------------------------------------------- 消息
-    def add_message(self, conv_id: int, role: str, content: str) -> Message:
+    def add_message(self, conv_id: int, role: str, content: str,
+                    meta: Optional[dict] = None) -> Message:
         now = time.time()
+        meta_json = json.dumps(meta or {}, ensure_ascii=False)
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO messages (conversation_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (conv_id, role, content, now),
+                "INSERT INTO messages (conversation_id, role, content, "
+                "meta, created_at) VALUES (?, ?, ?, ?, ?)",
+                (conv_id, role, content, meta_json, now),
             )
             msg_id = cur.lastrowid
             conn.execute(
@@ -171,7 +183,8 @@ class ChatStore:
                 (now, conv_id),
             )
             return Message(id=msg_id, conversation_id=conv_id,
-                           role=role, content=content, created_at=now)
+                           role=role, content=content, meta=meta or {},
+                           created_at=now)
 
     def list_messages(self, conv_id: int) -> list[Message]:
         with self._connect() as conn:
@@ -183,5 +196,18 @@ class ChatStore:
             return [Message(
                 id=r["id"], conversation_id=r["conversation_id"],
                 role=r["role"], content=r["content"],
+                meta=self._parse_meta(r["meta"]),
                 created_at=r["created_at"],
             ) for r in rows]
+
+    @staticmethod
+    def _parse_meta(raw) -> dict:
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}

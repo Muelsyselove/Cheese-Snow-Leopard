@@ -185,11 +185,22 @@ function openModal(opts) {
   const backdrop = el("div", "modal-backdrop");
   const modal = el("div", "modal glass" + (opts.wide ? " wide" : ""));
   const title = el("div", "modal-title", opts.title || "");
+  const head = el("div", "modal-head");
   const body = el("div", "modal-body");
   if (typeof opts.body === "string") body.innerHTML = opts.body;
   else if (opts.body instanceof Node) body.appendChild(opts.body);
   const actions = el("div", "modal-actions");
   const close = () => backdrop.remove();
+  // 标题右上角关闭按钮（除不可关闭的审批弹窗外总显示）
+  if (opts.dismissable !== false) {
+    const closeBtn = el("button", "modal-close", "✕");
+    closeBtn.setAttribute("aria-label", t("common.close"));
+    closeBtn.onclick = () => close();
+    head.appendChild(title);
+    head.appendChild(closeBtn);
+  } else {
+    head.appendChild(title);
+  }
   (opts.actions || [{ label: t("common.ok"), primary: true }]).forEach((a) => {
     const btn = el("button", "btn" + (a.primary ? " btn-primary" : "") +
       (a.danger ? " btn-danger" : ""), a.label);
@@ -199,7 +210,7 @@ function openModal(opts) {
     };
     actions.appendChild(btn);
   });
-  modal.appendChild(title);
+  modal.appendChild(head);
   modal.appendChild(body);
   if ((opts.actions || []).length !== 0) modal.appendChild(actions);
   backdrop.appendChild(modal);
@@ -361,32 +372,55 @@ function getScreenPos(e) {
 }
 
 // 无边框窗口：拖动标题栏移动窗口（pywebview easy_drag=False，改用桥接实现）
-// 同时支持鼠标和触控事件
+// 同时支持鼠标和触控事件。改用"绝对定位 + requestAnimationFrame 节流"，
+// 每次移动直接把窗口对准光标位置，避免逐帧异步增量带来的滞后与漂移。
 function initWindowDrag() {
   const titlebar = document.getElementById("titlebar");
-  const drag = { active: false, lx: 0, ly: 0 };
+  const drag = { active: false, sx: 0, sy: 0, offset: null, mx: 0, my: 0, raf: 0 };
 
   function onDown(e) {
     if (e.button !== undefined && e.button !== 0) return;
     if (e.target.closest(".tb-btn")) return; // 让最小化/最大化/关闭按钮正常点击
     const pos = getScreenPos(e);
     drag.active = true;
-    drag.lx = pos.x;
-    drag.ly = pos.y;
+    drag.sx = pos.x;
+    drag.sy = pos.y;
+    drag.offset = null;
     e.preventDefault();
   }
 
   function onMove(e) {
     if (!drag.active) return;
     const pos = getScreenPos(e);
-    // 发送“本次 vs 上次”的增量，避免与 bridge 按当前坐标累加时重复计算
-    api("window_move", pos.x - drag.lx, pos.y - drag.ly);
-    drag.lx = pos.x;
-    drag.ly = pos.y;
+    drag.mx = pos.x;
+    drag.my = pos.y;
+    if (!drag.raf) drag.raf = requestAnimationFrame(step);
     e.preventDefault();
   }
 
-  function onUp() { drag.active = false; }
+  function step() {
+    drag.raf = 0;
+    if (!drag.active) return;
+    if (!drag.offset) {
+      // 首次移动：先取窗口当前位置，计算按住点相对窗口的偏移
+      api("window_get_bounds").then((b) => {
+        if (!drag.active || !b) return;
+        drag.offset = { x: drag.sx - b.x, y: drag.sy - b.y };
+        doMove();
+      });
+      return;
+    }
+    doMove();
+  }
+
+  function doMove() {
+    api("window_move_abs", drag.mx - drag.offset.x, drag.my - drag.offset.y);
+  }
+
+  function onUp() {
+    drag.active = false;
+    if (drag.raf) { cancelAnimationFrame(drag.raf); drag.raf = 0; }
+  }
 
   titlebar.addEventListener("mousedown", onDown);
   titlebar.addEventListener("touchstart", onDown, { passive: false });
@@ -397,9 +431,9 @@ function initWindowDrag() {
 }
 
 // 无边框窗口：边缘/角落拖动缩放（pywebview 无原生缩放，需桥接实现）
-// 同时支持鼠标和触控事件
+// 同时支持鼠标和触控事件。以按下时边界 + 累计位移计算目标矩形，rAF 节流。
 function initWindowResize() {
-  const drag = { active: false, dir: null, lx: 0, ly: 0 };
+  const drag = { active: false, dir: null, sx: 0, sy: 0, bounds: null, mx: 0, my: 0, raf: 0 };
 
   function onDown(e) {
     const h = e.currentTarget;
@@ -407,23 +441,47 @@ function initWindowResize() {
     const pos = getScreenPos(e);
     drag.active = true;
     drag.dir = h.dataset.dir;
-    drag.lx = pos.x;
-    drag.ly = pos.y;
+    drag.sx = pos.x;
+    drag.sy = pos.y;
+    drag.bounds = null;
     document.body.classList.add("win-resizing");
   }
 
   function onMove(e) {
     if (!drag.active) return;
     const pos = getScreenPos(e);
-    api("window_resize_drag", drag.dir, pos.x - drag.lx, pos.y - drag.ly);
-    drag.lx = pos.x;
-    drag.ly = pos.y;
+    drag.mx = pos.x;
+    drag.my = pos.y;
+    if (!drag.raf) drag.raf = requestAnimationFrame(step);
     e.preventDefault();
+  }
+
+  function step() {
+    drag.raf = 0;
+    if (!drag.active) return;
+    if (!drag.bounds) {
+      api("window_get_bounds").then((b) => {
+        if (!drag.active || !b) return;
+        drag.bounds = b;
+        doResize();
+      });
+      return;
+    }
+    doResize();
+  }
+
+  function doResize() {
+    const dx = drag.mx - drag.sx;
+    const dy = drag.my - drag.sy;
+    api("window_resize_abs", drag.dir,
+      drag.bounds.x, drag.bounds.y, drag.bounds.width, drag.bounds.height,
+      dx, dy);
   }
 
   function onUp() {
     if (!drag.active) return;
     drag.active = false;
+    if (drag.raf) { cancelAnimationFrame(drag.raf); drag.raf = 0; }
     document.body.classList.remove("win-resizing");
   }
 

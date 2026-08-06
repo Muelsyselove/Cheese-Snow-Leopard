@@ -164,6 +164,8 @@ class WebBridge:
         self._generating = False
         self._interrupted = False
         self._steps: list[dict] = []
+        self._reasoning_text = ""
+        self._last_refs: list[dict] = []
         self._gen_lock = threading.Lock()
 
         # 后台任务运行标记
@@ -312,6 +314,77 @@ class WebBridge:
             logger.debug(f"窗口缩放失败: {e}")
             return {}
 
+    def window_get_bounds(self) -> dict:
+        """返回窗口当前物理像素边界（绝对定位拖动/缩放用）"""
+        form = getattr(self._window, "native", None)
+        if form is None:
+            return {}
+        try:
+            return {"x": int(form.Location.X), "y": int(form.Location.Y),
+                    "width": int(form.Width), "height": int(form.Height)}
+        except Exception as e:
+            logger.debug(f"读取窗口边界失败: {e}")
+            return {}
+
+    def window_move_abs(self, x: int, y: int):
+        """无边框窗口绝对定位（物理像素）——前端按光标位置平滑拖动"""
+        form = getattr(self._window, "native", None)
+        if form is None:
+            return
+        try:
+            scale = getattr(form, "_scale", None) or 1.0
+            self._window.move(int(x) / scale, int(y) / scale)
+        except Exception as e:
+            logger.debug(f"窗口绝对移动失败: {e}")
+
+    def window_resize_abs(self, direction: str, start_x: int, start_y: int,
+                          start_w: int, start_h: int, dx: int, dy: int) -> dict:
+        """无边框窗口边缘/角落缩放（绝对定位，物理像素）。
+
+        以按下时的起始边界 + 自按下累计位移计算目标矩形，
+        避免增量累加造成的漂移与滞后，使缩放跟手。
+        """
+        form = getattr(self._window, "native", None)
+        if form is None:
+            return {}
+        try:
+            d = (direction or "").lower()
+            dx = int(dx or 0)
+            dy = int(dy or 0)
+            scale = getattr(form, "_scale", None) or 1.0
+            new_x, new_y = int(start_x), int(start_y)
+            new_w, new_h = int(start_w), int(start_h)
+            if "e" in d:
+                new_w = start_w + dx
+            if "s" in d:
+                new_h = start_h + dy
+            if "w" in d:
+                new_w = start_w - dx
+                new_x = start_x + dx
+            if "n" in d:
+                new_h = start_h - dy
+                new_y = start_y + dy
+            # 最小尺寸钳制（西/北边被截断时位置回退）
+            min_w = form.MinimumSize.Width if hasattr(
+                form, "MinimumSize") else 0
+            min_h = form.MinimumSize.Height if hasattr(
+                form, "MinimumSize") else 0
+            if new_w < min_w:
+                if "w" in d:
+                    new_x = start_x + (start_w - min_w)
+                new_w = min_w
+            if new_h < min_h:
+                if "n" in d:
+                    new_y = start_y + (start_h - min_h)
+                new_h = min_h
+            self._window.move(new_x / scale, new_y / scale)
+            self._window.resize(new_w / scale, new_h / scale)
+            return {"width": int(round(new_w / scale)),
+                    "height": int(round(new_h / scale))}
+        except Exception as e:
+            logger.debug(f"窗口绝对缩放失败: {e}")
+            return {}
+
     def open_external(self, url: str):
         """在系统默认浏览器打开外部链接（仅用于申请 Key / 文档等显式外链）"""
         try:
@@ -430,7 +503,8 @@ class WebBridge:
         for msg in self.chat_store.list_messages(conv_id):
             self._history.append({"role": msg.role, "content": msg.content})
             if msg.role in ("user", "assistant"):
-                messages.append({"role": msg.role, "content": msg.content})
+                messages.append({"role": msg.role, "content": msg.content,
+                                 "meta": msg.meta})
         # 恢复该对话所用模型
         if conv.model:
             for m in self._models():
@@ -505,6 +579,8 @@ class WebBridge:
 
         self._interrupted = False
         self._steps = []
+        self._reasoning_text = ""
+        self._last_refs = []
         self._emit("chat", "assistantMessageStarted", None)
         self._emit("chat", "generatingChanged", True)
         history = list(self._history)
@@ -568,6 +644,7 @@ class WebBridge:
                         if not refs:
                             refs = trace_references_fallback(answer, retrieved)
                         if refs:
+                            self._last_refs = refs
                             self._emit("chat", "referencesAppended", refs)
                 except Exception as e:
                     logger.debug(f"引用溯源失败（非致命）: {e}")
@@ -585,6 +662,7 @@ class WebBridge:
             self._steps.append({"kind": "thinking", "status": "running",
                                 "detail": ""})
             self._emit("chat", "stepsUpdated", list(self._steps))
+        self._reasoning_text += text
         self._emit("chat", "reasoningChunk", text)
 
     def _on_token(self, text: str):
@@ -626,8 +704,13 @@ class WebBridge:
         if answer and not self._interrupted:
             self._history.append({"role": "assistant", "content": answer})
             if self.chat_store and self._current_conv_id:
+                meta = {
+                    "steps": self._steps,
+                    "reasoning": self._reasoning_text,
+                    "refs": self._last_refs,
+                }
                 self.chat_store.add_message(
-                    self._current_conv_id, "assistant", answer)
+                    self._current_conv_id, "assistant", answer, meta=meta)
             self._maybe_auto_name()
         any_running = False
         for s in self._steps:

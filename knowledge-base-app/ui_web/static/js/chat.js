@@ -3,6 +3,27 @@
    ============================================================ */
 "use strict";
 
+/* 引用辅助：构建 chunk_id → 序号(1-based) 映射，保持正文引用与来源列表编号一致 */
+function buildRefIndex(refs) {
+  const map = {};
+  let n = 1;
+  (refs || []).forEach((r) => {
+    if (r && r.chunk_id && !(r.chunk_id in map)) map[r.chunk_id] = n++;
+  });
+  return map;
+}
+
+/* 渲染回答：先渲染 markdown，再把正文中的【chunk_x】替换为可点击的【n】 */
+function renderAnswer(text, refs) {
+  const map = buildRefIndex(refs);
+  let html = renderMarkdown(text);
+  html = html.replace(/【(chunk_\d+)】/g, (_, cid) => {
+    const n = map[cid];
+    return n ? `<span class="cite-ref" data-ref-idx="${n}">${n}</span>` : `【${cid}】`;
+  });
+  return html;
+}
+
 const ChatPage = {
   convId: -1,
   conversations: [],
@@ -149,6 +170,19 @@ const ChatPage = {
     Bus.on("chat", "titleUpdated", (p) => {
       const c = this.conversations.find((x) => x.convId === p.convId);
       if (c) { c.title = p.title; this.renderConvList(); }
+    });
+    // 引用点击（正文编号 + 来源列表）→ 查看溯源内容。
+    // 用事件委托是为了兼容流式期间 answer 被反复重渲染、以及静态回载，绑定在滚动容器上即可。
+    this.els.scroll.addEventListener("click", (e) => {
+      const targ = e.target.closest(".cite-ref, .ref-chip");
+      if (!targ) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = parseInt(targ.getAttribute("data-ref-idx"), 10);
+      const row = targ.closest(".msg-row");
+      const refs = row && row._refs ? row._refs : [];
+      const ref = refs[idx - 1];
+      if (ref) this.showRefDetail(ref);
     });
   },
 
@@ -330,7 +364,7 @@ const ChatPage = {
     if (!this.messages.length) { this.renderEmpty(); return; }
     this.messages.forEach((m) => {
       if (m.role === "user") this.appendUserBubble(m.content);
-      else if (m.role === "assistant") this.appendAssistantStatic(m.content);
+      else if (m.role === "assistant") this.appendAssistantStatic(m.content, m.meta);
     });
     this.scrollBottom(true);
   },
@@ -343,12 +377,91 @@ const ChatPage = {
     this.els.scroll.appendChild(row);
   },
 
-  appendAssistantStatic(text) {
+  appendAssistantStatic(text, meta) {
     const row = el("div", "msg-row ai");
+    const refs = (meta && meta.refs) || [];
+    row._refs = refs;
     row.innerHTML = `
       <div class="msg-avatar ai animate-breathe">🐆</div>
-      <div class="msg-body"><div class="bubble">${renderMarkdown(text)}</div></div>`;
+      <div class="msg-body">
+        ${this.renderStaticSteps(meta)}
+        <div class="bubble">${renderAnswer(text, refs)}</div>
+        ${this.renderStaticRefs(refs)}
+      </div>`;
+    this.bindRefClicks(row, refs);
+    this.bindStepClicks(row);
     this.els.scroll.appendChild(row);
+  },
+
+  // 静态(已持久化)消息的步骤时间线 —— 默认折叠，每步可点击展开查看内容
+  renderStaticSteps(meta) {
+    const steps = (meta && meta.steps) || [];
+    if (!steps.length) return "";
+    const reasoning = (meta && meta.reasoning) || "";
+    const items = steps.map((s) => {
+      const name = t("chat.step." + s.kind) !== ("chat.step." + s.kind)
+        ? t("chat.step." + s.kind) : s.kind;
+      let content = "";
+      if (s.kind === "thinking") content = reasoning;
+      else if (s.kind === "search" && s.status === "done" && s.detail !== "") {
+        content = t("chat.step.searchFound", { count: s.detail });
+      } else if (s.detail) content = String(s.detail);
+      return `<div class="step ${s.status}">
+        <div class="step-dot"></div>
+        <div class="step-main">
+          <div class="step-head">
+            <span class="step-name">${escapeHtml(name)}</span>
+            ${content ? '<span class="step-arrow">▶</span>' : ""}
+          </div>
+          ${content ? `<div class="step-content step-think">${escapeHtml(content)}</div>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+    return `<div class="steps">${items}</div>`;
+  },
+
+  // 静态(已持久化)消息的引用来源列表
+  renderStaticRefs(refs) {
+    if (!refs || !refs.length) return "";
+    const map = buildRefIndex(refs);
+    return `<div class="refs">` +
+      `<div class="refs-label">${escapeHtml(t("chat.references"))}</div>` +
+      refs.map((r) => {
+        const idx = r.chunk_id ? (map[r.chunk_id] || "") : "";
+        const label = r.source_file || r.file_name || r.fileName || r.chunk_id || "";
+        const page = r.page ? ` · ${t("chat.page", { page: r.page })}` : "";
+        return `<span class="ref-chip" data-ref-idx="${idx}">${idx ? idx + " · " : ""}${escapeHtml(label)}${escapeHtml(page)}</span>`;
+      }).join("") + `</div>`;
+  },
+
+  // 绑定引用点击 → 查看溯源内容
+  bindRefClicks(container, refs) {
+    if (!container || !refs) return;
+    container.querySelectorAll(".ref-chip").forEach((chip, i) => {
+      chip.onclick = (e) => { e.stopPropagation(); this.showRefDetail(refs[i]); };
+    });
+  },
+
+  bindStepClicks(container) {
+    if (!container) return;
+    container.querySelectorAll(".step").forEach((s) => {
+      s.onclick = () => s.classList.toggle("expanded");
+    });
+  },
+
+  // 查看单个引用被溯源到的内容
+  showRefDetail(ref) {
+    if (!ref) return;
+    const body = el("div", "ref-detail");
+    const page = ref.page ? t("chat.page", { page: ref.page }) : "";
+    const type = ref.type ? escapeHtml(ref.type) : "";
+    body.innerHTML = `
+      <div class="form-row"><span class="text-sub">${escapeHtml(t("chat.referenceSource"))}：</span><span>${escapeHtml(ref.source_file || ref.file_name || ref.chunk_id || "")}</span></div>
+      ${page ? `<div class="form-row"><span class="text-sub">${escapeHtml(t("chat.referencePage"))}：</span><span>${escapeHtml(page)}</span></div>` : ""}
+      ${type ? `<div class="form-row"><span class="text-sub">${escapeHtml(t("chat.referenceType"))}：</span><span>${type}</span></div>` : ""}
+      <div class="ref-detail-title">${escapeHtml(t("chat.referenceExcerpt"))}</div>
+      <div class="ref-detail-excerpt">${escapeHtml(ref.excerpt || ref.content || "")}</div>`;
+    openModal({ title: t("chat.referenceDetail"), body });
   },
 
   // ---------------------------------------------------------- 流式
@@ -370,6 +483,7 @@ const ChatPage = {
       e.currentTarget.parentElement.classList.toggle("open");
     };
     this.els.scroll.appendChild(row);
+    row._refs = [];
     this.stream = {
       row,
       steps: row.querySelector(".steps"),
@@ -381,6 +495,7 @@ const ChatPage = {
       refs: row.querySelector(".refs"),
       answerText: "",
       reasoningText: "",
+      lastRefs: [],
     };
     this.scrollBottom(true);
   },
@@ -391,6 +506,11 @@ const ChatPage = {
     st.reasoningText += text;
     st.thinkBox.classList.remove("hidden");
     st.thinkContent.textContent = st.reasoningText;
+    // 同步更新已展开的思考步骤内容
+    if (st.steps) {
+      const c = st.steps.querySelector(".step.expanded .step-content");
+      if (c) c.textContent = st.reasoningText;
+    }
     this.scrollBottom();
   },
 
@@ -400,7 +520,7 @@ const ChatPage = {
     st.answerText += text;
     if (st.typing) st.typing.remove();
     st.typing = null;
-    st.answer.innerHTML = renderMarkdown(st.answerText);
+    st.answer.innerHTML = renderAnswer(st.answerText, st.lastRefs || []);
     this.scrollBottom();
   },
 
@@ -408,34 +528,48 @@ const ChatPage = {
     const st = this.stream;
     if (!st || !steps || !steps.length) return;
     st.steps.classList.remove("hidden");
+    const reasoning = st.reasoningText || "";
     st.steps.innerHTML = steps.map((s) => {
       const name = t("chat.step." + s.kind) !== ("chat.step." + s.kind)
         ? t("chat.step." + s.kind) : s.kind;
-      let detail = "";
-      if (s.kind === "search" && s.status === "done" && s.detail !== "") {
-        detail = t("chat.step.searchFound", { count: s.detail });
-      } else if (s.kind === "search" && s.status === "running" && s.detail) {
-        detail = String(s.detail);
-      }
+      let content = "";
+      if (s.kind === "thinking") content = reasoning;
+      else if (s.kind === "search" && s.status === "done" && s.detail !== "") {
+        content = t("chat.step.searchFound", { count: s.detail });
+      } else if (s.detail) content = String(s.detail);
       return `<div class="step ${s.status}">
         <div class="step-dot"></div>
-        <div><div class="step-name">${escapeHtml(name)}</div>
-        ${detail ? `<div class="step-detail">${escapeHtml(detail)}</div>` : ""}</div>
+        <div class="step-main">
+          <div class="step-head">
+            <span class="step-name">${escapeHtml(name)}${s.kind === "thinking" && s.status === "running" ? ' <span class="step-running">…</span>' : ""}</span>
+            ${content ? '<span class="step-arrow">▶</span>' : ""}
+          </div>
+          ${content ? `<div class="step-content step-think">${escapeHtml(content)}</div>` : ""}
+        </div>
       </div>`;
     }).join("");
+    this.bindStepClicks(st.steps);
     this.scrollBottom();
   },
 
   appendRefs(refs) {
     const st = this.stream;
     if (!st || !refs || !refs.length) return;
+    st.lastRefs = refs;
+    st.row._refs = refs;
+    const map = buildRefIndex(refs);
     st.refs.classList.remove("hidden");
-    st.refs.innerHTML = `<div class="refs-label">${escapeHtml(t("chat.references"))}</div>` +
+    st.refs.innerHTML =
+      `<div class="refs-label">${escapeHtml(t("chat.references"))}</div>` +
       refs.map((r) => {
-        const label = r.file_name || r.fileName || r.source || r.chunk_id || "";
+        const idx = r.chunk_id ? (map[r.chunk_id] || "") : "";
+        const label = r.source_file || r.file_name || r.fileName || r.chunk_id || "";
         const page = r.page ? ` · ${t("chat.page", { page: r.page })}` : "";
-        return `<span class="ref-chip">${escapeHtml(label)}${escapeHtml(page)}</span>`;
+        return `<span class="ref-chip" data-ref-idx="${idx}">${idx ? idx + " · " : ""}${escapeHtml(label)}${escapeHtml(page)}</span>`;
       }).join("");
+    this.bindRefClicks(st.refs, refs);
+    // 引用到达后重渲染正文，把【chunk_x】替换为【n】
+    if (st.answerText) st.answer.innerHTML = renderAnswer(st.answerText, refs);
     this.scrollBottom();
   },
 
@@ -461,8 +595,12 @@ const ChatPage = {
       if (this.stream.answerText) {
         this.messages.push({ role: "assistant", content: this.stream.answerText });
       }
-      // 折叠思考过程
+      // 思考全部结束：自动折叠思考过程与各步骤
       this.stream.thinkBox.classList.remove("open");
+      if (this.stream.steps) {
+        this.stream.steps.querySelectorAll(".step").forEach((el) =>
+          el.classList.remove("expanded"));
+      }
       this.stream = null;
     }
   },
