@@ -18,12 +18,18 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 程序根目录（main.py 所在目录，即 utils/ 的上一级）
-APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 程序根目录：
+# - 开发模式：main.py 所在目录（即 utils/ 的上一级）
+# - PyInstaller 打包后：exe 所在目录（数据随 exe 存放，便于用户查看/迁移）
+if getattr(sys, "frozen", False):
+    APP_ROOT = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DATA_ROOT = os.path.join(APP_ROOT, "data")
 
 # 数据子目录名

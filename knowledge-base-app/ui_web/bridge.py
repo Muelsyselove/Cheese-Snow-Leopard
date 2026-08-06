@@ -214,6 +214,31 @@ class WebBridge:
     def _status(self, msg: str):
         self._emit("app", "status", msg)
 
+    def save_theme_state(self, state: dict | None = None):
+        """持久化当前主题（id/base/tokens），供启动 Splash 跟随主题。
+
+        前端 ThemeManager.apply() 每次应用主题时调用；
+        写入 <data_root>/cache/theme_state.json，失败静默（非致命）。
+        """
+        try:
+            data = state if isinstance(state, dict) else {}
+            base = "light" if data.get("base") == "light" else "dark"
+            tokens = data.get("tokens")
+            if not isinstance(tokens, dict):
+                tokens = {}
+            theme_id = str(data.get("id") or base)
+            from utils.paths import get_path
+            cache_dir = get_path("cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            payload = {"id": theme_id, "base": base, "tokens": tokens}
+            with open(os.path.join(cache_dir, "theme_state.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            return {"ok": True}
+        except Exception as e:
+            logger.debug(f"主题状态保存失败（非致命）: {e}")
+            return {"ok": False}
+
     # ============================================================ 窗口控制
     def window_minimize(self):
         if self._window is not None:
