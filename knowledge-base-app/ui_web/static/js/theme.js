@@ -51,8 +51,18 @@ class ThemeManager {
     }
     this.active = id;
     if (opts.persist !== false) localStorage.setItem(this._prefKey, id);
+    this._persistForSplash(theme, base);
     window.dispatchEvent(new CustomEvent("themechange", { detail: { id } }));
     return true;
+  }
+
+  /** 持久化主题到后端（data/cache/theme_state.json），供启动 Splash 跟随主题 */
+  _persistForSplash(theme, base) {
+    try {
+      if (!window.pywebview || !window.pywebview.api) return;
+      const tokens = theme.builtin ? {} : (theme.tokens || {});
+      window.pywebview.api.save_theme_state({ id: theme.id, base, tokens });
+    } catch { /* 非致命：桥未就绪时跳过 */ }
   }
 
   /** 注册自定义主题。tokens: {"--bg-top": "#fff", ...}（键可省略 -- 前缀） */
