@@ -15,6 +15,7 @@ const FilesPage = {
         <div class="page-title" data-t="files.title"></div>
         <div class="toolbar-spacer"></div>
         <button id="files-refresh" class="btn" data-t="common.refresh"></button>
+        <button id="files-import-url" class="btn" data-t="files.importUrl"></button>
         <button id="files-import" class="btn btn-primary" data-t="files.import"></button>
       </div>
       <div class="progress hidden" id="files-progress"><i></i></div>
@@ -23,12 +24,14 @@ const FilesPage = {
       </div>`;
     this.els = {
       importBtn: document.getElementById("files-import"),
+      importUrlBtn: document.getElementById("files-import-url"),
       refreshBtn: document.getElementById("files-refresh"),
       progress: document.getElementById("files-progress"),
       bar: document.querySelector("#files-progress > i"),
       scroll: document.getElementById("files-scroll"),
     };
     this.els.importBtn.onclick = () => this.importFiles();
+    this.els.importUrlBtn.onclick = () => this.importUrl();
     this.els.refreshBtn.onclick = () => this.load();
 
     // 幂等守卫：防止 boot 重复执行导致 Bus 处理器重复注册
@@ -46,6 +49,7 @@ const FilesPage = {
       Bus.on("files", "importRunning", (b) => {
         this.importing = !!b;
         this.els.importBtn.disabled = !!b;
+        this.els.importUrlBtn.disabled = !!b;
         if (!b) setTimeout(() => { this.els.progress.classList.add("hidden"); this.els.bar.style.width = "0"; }, 600);
       });
       Bus.on("files", "importDone", () => this.load());
@@ -74,6 +78,39 @@ const FilesPage = {
     if (this.importing) return;
     const paths = await api("files_pick");
     if (paths && paths.length) await api("files_import", paths);
+  },
+
+  importUrl() {
+    if (this.importing) return;
+    const body = el("div");
+    const m = openModal({
+      title: t("files.importUrl"),
+      body,
+      actions: [
+        { label: t("common.cancel") },
+        {
+          label: t("files.importUrlConfirm"), primary: true,
+          onClick: () => {
+            const v = (body.querySelector("#url-input").value || "").trim();
+            if (!v) return false;
+            api("files_import_url", v);
+          },
+        },
+      ],
+    });
+    body.innerHTML = `
+      <div class="mb-s text-sub">${escapeHtml(t("files.importUrlHint"))}</div>
+      <div class="form-row">
+        <input class="input form-grow" id="url-input" placeholder="https://…">
+      </div>`;
+    const input = body.querySelector("#url-input");
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) {
+        const v = (input.value || "").trim();
+        if (v) { api("files_import_url", v); m.close(); }
+      }
+    });
+    setTimeout(() => input.focus(), 50);
   },
 
   async deleteDoc(doc) {

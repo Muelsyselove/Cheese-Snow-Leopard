@@ -132,23 +132,15 @@ def _init_services(progress) -> dict:
         logger.warning(f"部分组件未就绪: parser={bool(parser)} embedder={bool(embedder)} "
                        f"llm={bool(llm)} qdrant={bool(qdrant)}")
 
-    # 2.5 创建存储仓库（容错）
+    # 2.5 创建存储仓库（容错；PG 不可达自动回退 SQLite，MinIO 不可达回退 LocalFS）
     progress("连接存储服务…" if _is_zh() else "Connecting storage services…", 0.55)
     pg_repo = minio_repo = None
     if config is not None:
         try:
-            from repositories import PostgresRepository
-            pg_cfg = config.storage.get("postgres", {})
-            pg_repo = PostgresRepository(
-                host=pg_cfg.get("host", "localhost"),
-                port=pg_cfg.get("port", 5432),
-                database=pg_cfg.get("database", "knowledge_base"),
-                user=pg_cfg.get("user", "admin"),
-                password=pg_cfg.get("password", "")
-            )
+            pg_repo = factory.create_metadata_repository()
         except Exception as e:
-            startup_errors.append(f"PG 仓库创建失败: {e}")
-            logger.error(f"PG 仓库创建失败: {e}", exc_info=True)
+            startup_errors.append(f"元数据仓库创建失败: {e}")
+            logger.error(f"元数据仓库创建失败: {e}", exc_info=True)
         try:
             minio_repo = factory.create_object_storage()
         except Exception as e:

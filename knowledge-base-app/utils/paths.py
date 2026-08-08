@@ -41,6 +41,8 @@ SUBDIRS = {
     "cache": "cache",
     "logs": "logs",
     "tmp": "tmp",
+    "db": "db",
+    "qdrant": "qdrant",
 }
 
 # 当前数据根目录（启动时由 init_paths() 设置）
@@ -111,6 +113,16 @@ def get_tmp_dir() -> str:
 def get_logs_dir() -> str:
     """日志目录"""
     return get_path("logs")
+
+
+def get_metadata_db_path() -> str:
+    """元数据 SQLite 数据库路径（零配置回退方案）"""
+    return os.path.join(get_path("db"), "knowledge_base.db")
+
+
+def get_qdrant_local_path() -> str:
+    """Qdrant 本地嵌入式存储目录（零配置回退方案，无需服务器）"""
+    return get_path("qdrant")
 
 
 def migrate_data_root(new_root: str) -> tuple[bool, str]:

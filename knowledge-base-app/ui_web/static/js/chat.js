@@ -32,6 +32,7 @@ const ChatPage = {
   generating: false,
   thinking: true,
   thinkingStrength: "auto",
+  queryMode: false,
   hasRag: false,
   messages: [],          // [{role, content}] 已完成消息
   stream: null,          // 当前流式气泡引用
@@ -50,6 +51,7 @@ const ChatPage = {
           <button id="model-btn" class="btn model-btn"></button>
           <button id="thinking-toggle" class="pill-toggle"></button>
           <select id="thinking-strength" class="strength-select hidden" title="${escapeHtml(t("chat.thinkingStrengthTip"))}"></select>
+          <button id="query-toggle" class="pill-toggle"></button>
           <div class="toolbar-spacer"></div>
         </div>
         <div class="chat-scroll" id="chat-scroll"></div>
@@ -70,6 +72,7 @@ const ChatPage = {
       modelBtn: document.getElementById("model-btn"),
       thinkToggle: document.getElementById("thinking-toggle"),
       strengthSel: document.getElementById("thinking-strength"),
+      queryToggle: document.getElementById("query-toggle"),
       newConv: document.getElementById("conv-new"),
     };
     this.els.newConv.onclick = () => this.newConversation();
@@ -79,6 +82,10 @@ const ChatPage = {
     this.els.thinkToggle.onclick = () => {
       this.thinking = !this.thinking;
       this.renderThinkingToggle();
+    };
+    this.els.queryToggle.onclick = () => {
+      this.queryMode = !this.queryMode;
+      this.renderQueryToggle();
     };
     this.els.strengthSel.onchange = () => {
       this.thinkingStrength = this.els.strengthSel.value || "auto";
@@ -112,6 +119,7 @@ const ChatPage = {
     this.els.stop.textContent = t("chat.stop");
     this.els.input.placeholder = t("chat.placeholder");
     this.renderThinkingToggle();
+    this.renderQueryToggle();
     this.renderModelBtn();
     this.renderConvList();
     if (!this.messages.length && !this.generating) this.renderEmpty();
@@ -321,6 +329,14 @@ const ChatPage = {
       this.els.strengthSel.classList.toggle("hidden", !this.thinking);
       this.els.strengthSel.value = this.thinkingStrength || "auto";
     }
+  },
+
+  renderQueryToggle() {
+    const b = this.els.queryToggle;
+    if (!b) return;
+    b.classList.toggle("on", this.queryMode);
+    b.textContent = "🔍 " + t("chat.queryMode");
+    b.title = t("chat.queryModeTip");
   },
 
   renderGenerating() {
@@ -616,8 +632,8 @@ const ChatPage = {
     this.els.input.value = "";
     this.els.input.style.height = "auto";
     const id = await api("chat_send", this.convId, text, this.thinking,
-      this.thinkingStrength);
-    if (id > 0 && id !== this.convId) {
+      this.thinkingStrength, this.queryMode);
+    if (!this.queryMode && id > 0 && id !== this.convId) {
       this.convId = id;
       this.renderConvList();
     }

@@ -23,25 +23,44 @@ logger = logging.getLogger(__name__)
 
 
 class QdrantStore:
-    """Qdrant 向量存储实现"""
+    """Qdrant 向量存储实现
+
+    两种运行模式：
+    - 服务器模式：连接 host:port 的 Qdrant 服务（生产方案）
+    - 本地嵌入模式：local_path 指定存储目录，QdrantClient(path=...)
+      无需服务器，零配置开箱即用。注意本地模式不支持服务端 BM25
+      文本推理（Qwen3 降级路径），BGE-M3 客户端 sparse 不受影响。
+    """
 
     DENSE_NAME = "dense"
     SPARSE_NAME = "sparse"
 
     def __init__(self, host: str = "localhost", port: int = 6333,
                  collection: str = "text_chunks",
-                 sparse_support: bool = False):
+                 sparse_support: bool = False,
+                 local_path: Optional[str] = None):
         self.host = host
         self.port = port
         self.collection = collection
         self.sparse_support = sparse_support
+        self.local_path = local_path
         self._client = None
         self._dim: Optional[int] = None
+
+    @property
+    def is_local_mode(self) -> bool:
+        return bool(self.local_path)
 
     def _get_client(self):
         if self._client is None:
             from qdrant_client import QdrantClient
-            self._client = QdrantClient(host=self.host, port=self.port)
+            if self.local_path:
+                import os
+                os.makedirs(self.local_path, exist_ok=True)
+                self._client = QdrantClient(path=self.local_path)
+                logger.info(f"Qdrant 本地嵌入模式: {self.local_path}")
+            else:
+                self._client = QdrantClient(host=self.host, port=self.port)
         return self._client
 
     def ensure_collection(self, dim: int):

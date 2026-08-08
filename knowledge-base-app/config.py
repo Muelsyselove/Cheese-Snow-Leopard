@@ -2,15 +2,34 @@
 
 配置加载时调用 resolve_credential_placeholder 解析 keyring:xxx 占位符为真实凭据。
 工厂根据配置动态创建组件实例，业务层仅接收接口。
+
+零配置回退（开箱即用）：
+- 元数据仓库：PostgreSQL 不可达时自动回退 SQLite（data/db/knowledge_base.db）
+- 向量存储：Qdrant 服务器不可达时自动回退本地嵌入模式（data/qdrant/）
+- 对象存储：MinIO 不可达时自动回退本地文件系统（data/files/）
+回退仅在本进程生效，不回写 config.yaml；服务恢复后重启即回到生产方案。
 """
 from __future__ import annotations
 
+import logging
+import socket
 from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
 
 from utils.credentials import resolve_credential_placeholder
+
+logger = logging.getLogger(__name__)
+
+
+def _tcp_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    """探测 TCP 端口是否可连（用于服务自动发现与零配置回退）"""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 @dataclass
@@ -117,14 +136,62 @@ class ComponentFactory:
         )
 
     def create_vector_store(self, sparse_support: bool):
-        """创建向量存储"""
+        """创建向量存储
+
+        零配置回退：未显式配置 local_path 且 Qdrant 服务器不可达时，
+        自动切换到本地嵌入模式（data/qdrant/），无需启动 Qdrant 服务。
+        """
         from adapters.qdrant_store import QdrantStore
-        cfg = self.config.storage["qdrant"]
+        cfg = (self.config.storage or {}).get("qdrant", {})
+        host = cfg.get("host", "localhost")
+        port = int(cfg.get("port", 6333))
+        local_path = cfg.get("local_path") or None
+        if local_path is None and not _tcp_open(host, port):
+            from utils.paths import get_qdrant_local_path
+            local_path = get_qdrant_local_path()
+            logger.warning(
+                f"Qdrant 服务器 {host}:{port} 不可达，"
+                f"回退到本地嵌入模式: {local_path}"
+            )
         return QdrantStore(
-            host=cfg["host"], port=cfg["port"],
-            collection=cfg["collection"],
-            sparse_support=sparse_support
+            host=host, port=port,
+            collection=cfg.get("collection", "text_chunks"),
+            sparse_support=sparse_support,
+            local_path=local_path,
         )
+
+    def create_metadata_repository(self):
+        """创建元数据仓库（document/chunk/category/compensation）
+
+        零配置回退：PostgreSQL 不可达（端口关闭或连接失败）时，
+        自动切换到 SQLite（data/db/knowledge_base.db），自动建表。
+        """
+        storage = self.config.storage or {}
+        pg_cfg = storage.get("postgres") or {}
+        host = pg_cfg.get("host", "localhost")
+        port = int(pg_cfg.get("port", 5432))
+        if pg_cfg and _tcp_open(host, port):
+            try:
+                from repositories import PostgresRepository
+                repo = PostgresRepository(
+                    host=host, port=port,
+                    database=pg_cfg.get("database", "knowledge_base"),
+                    user=pg_cfg.get("user", "admin"),
+                    password=pg_cfg.get("password", ""),
+                )
+                # 触发真实连接验证（库不存在/认证失败时抛异常 → 回退）
+                conn = repo._get_conn()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                logger.info(f"元数据仓库: PostgreSQL {host}:{port}")
+                return repo
+            except Exception as e:
+                logger.warning(f"PostgreSQL 连接失败，回退 SQLite: {e}")
+        from repositories import SQLiteRepository
+        from utils.paths import get_metadata_db_path
+        db_path = get_metadata_db_path()
+        logger.warning(f"元数据仓库: SQLite（零配置模式） {db_path}")
+        return SQLiteRepository(db_path)
 
     def create_snowflake(self):
         """创建 Snowflake ID 生成器"""
@@ -149,20 +216,27 @@ class ComponentFactory:
         """创建对象存储仓库
 
         按配置自动选择后端：
-        - storage.minio 段存在 → MinioRepository（生产方案）
+        - storage.minio 段存在且服务可达 → MinioRepository（生产方案）
+        - storage.minio 段存在但服务不可达 → LocalFSAdapter（零配置回退）
         - storage.local_fs 段存在 → LocalFSAdapter（轻量方案，技术文档 9.4）
         两者实现同一 ObjectStorage Protocol，业务层无感切换。
         """
         storage = self.config.storage or {}
         if "minio" in storage:
-            from repositories import MinioRepository
             cfg = storage["minio"]
-            return MinioRepository(
-                endpoint=cfg.get("endpoint", "localhost:9000"),
-                access_key=cfg.get("access_key", "admin"),
-                secret_key=cfg.get("secret_key", ""),
-                bucket=cfg.get("bucket", "knowledge-base"),
-                secure=cfg.get("secure", False),
+            endpoint = cfg.get("endpoint", "localhost:9000")
+            host, _, port_s = endpoint.partition(":")
+            if _tcp_open(host or "localhost", int(port_s or 9000)):
+                from repositories import MinioRepository
+                return MinioRepository(
+                    endpoint=endpoint,
+                    access_key=cfg.get("access_key", "admin"),
+                    secret_key=cfg.get("secret_key", ""),
+                    bucket=cfg.get("bucket", "knowledge-base"),
+                    secure=cfg.get("secure", False),
+                )
+            logger.warning(
+                f"MinIO {endpoint} 不可达，回退到本地文件系统存储"
             )
         if "local_fs" in storage:
             from repositories import LocalFSAdapter

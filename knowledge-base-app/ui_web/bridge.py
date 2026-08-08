@@ -43,6 +43,7 @@ DEFAULT_LANGUAGE = "zh_CN"
 # 导入进度消息 → DB parse_status 映射（用于实时刷新文件状态徽章）
 # 与 services/file_service.py 中 import_document 的 _report 文案保持一致。
 _IMPORT_STAGE_MAP = {
+    "抓取网页": "parsing",
     "上传文件": "parsing",
     "解析文档": "parsing",
     "AI 分类": "classifying",
@@ -571,28 +572,40 @@ class WebBridge:
 
     # ---------------------------------------------------------- 发送 / 中断
     def chat_send(self, conv_id: int, text: str, thinking: bool,
-                  thinking_strength: str = "auto") -> int:
-        """发送消息（生成在后台线程进行，流式事件推送）。返回会话 ID。"""
+                  thinking_strength: str = "auto",
+                  query_mode: bool = False) -> int:
+        """发送消息（生成在后台线程进行，流式事件推送）。返回会话 ID。
+
+        query_mode=True 时为查询模式：不创建/更新会话、不带历史上下文、
+        不写入对话存储、不触发自动命名，纯 RAG 问答（返回 -1）。
+        """
         question = (text or "").strip()
         if not question:
-            return conv_id or -1
+            return -1 if query_mode else (conv_id or -1)
         with self._gen_lock:
             if self._generating:
-                return conv_id or -1
+                return -1 if query_mode else (conv_id or -1)
             self._generating = True
 
-        if (conv_id or 0) <= 0 and self.chat_store is not None:
-            conv = self.chat_store.create_conversation(
-                title=self._tr("chat.newConversationTitle"))
-            conv_id = conv.id
-            self._emit("chat", "conversationsChanged", self._conversations())
-        self._current_conv_id = conv_id if (conv_id or 0) > 0 else None
+        if query_mode:
+            # 查询模式：无历史、不落库
+            conv_id = -1
+            history = []
+        else:
+            if (conv_id or 0) <= 0 and self.chat_store is not None:
+                conv = self.chat_store.create_conversation(
+                    title=self._tr("chat.newConversationTitle"))
+                conv_id = conv.id
+                self._emit("chat", "conversationsChanged", self._conversations())
+            self._current_conv_id = conv_id if (conv_id or 0) > 0 else None
+            self._history.append({"role": "user", "content": question})
+            if self.chat_store and self._current_conv_id:
+                self.chat_store.add_message(
+                    self._current_conv_id, "user", question)
+            history = list(self._history)
 
         llm = self._get_llm_client()
         self._emit("chat", "userMessageAppended", question)
-        self._history.append({"role": "user", "content": question})
-        if self.chat_store and self._current_conv_id:
-            self.chat_store.add_message(self._current_conv_id, "user", question)
 
         if llm is None and self.rag_service is None:
             self._emit("chat", "assistantError",
@@ -608,14 +621,13 @@ class WebBridge:
         self._last_refs = []
         self._emit("chat", "assistantMessageStarted", None)
         self._emit("chat", "generatingChanged", True)
-        history = list(self._history)
         threading.Thread(
             target=self._chat_run,
             args=(question, history, llm, bool(thinking),
-                  (thinking_strength or "auto")),
+                  (thinking_strength or "auto"), bool(query_mode)),
             daemon=True,
         ).start()
-        return self._current_conv_id or -1
+        return -1 if query_mode else (self._current_conv_id or -1)
 
     def chat_stop(self):
         self._interrupted = True
@@ -632,7 +644,8 @@ class WebBridge:
 
     # ---- 流式执行（后台线程），步骤状态机镜像 old_v2 ChatBridge ----
     def _chat_run(self, question: str, history: list[dict], llm,
-                  thinking: bool, thinking_strength: str = "auto"):
+                  thinking: bool, thinking_strength: str = "auto",
+                  query_mode: bool = False):
         answer = ""
         try:
             should_stop = lambda: self._interrupted  # noqa: E731
@@ -679,7 +692,7 @@ class WebBridge:
                        self._tr("chat.requestFailed", msg=e))
             answer = ""
         finally:
-            self._finalize_stream(answer)
+            self._finalize_stream(answer, query_mode=query_mode)
 
     def _on_reasoning(self, text: str):
         if not self._steps or self._steps[-1]["kind"] != "thinking" \
@@ -725,8 +738,8 @@ class WebBridge:
                 s["status"] = "done"
                 return
 
-    def _finalize_stream(self, answer: str):
-        if answer and not self._interrupted:
+    def _finalize_stream(self, answer: str, query_mode: bool = False):
+        if answer and not self._interrupted and not query_mode:
             self._history.append({"role": "assistant", "content": answer})
             if self.chat_store and self._current_conv_id:
                 meta = {
@@ -934,6 +947,46 @@ class WebBridge:
             if key in (msg or ""):
                 return stage
         return None
+
+    def files_import_url(self, url: str):
+        """从 URL 抓取网页并导入（后台线程，进度事件推送）"""
+        if self.file_service is None:
+            self._toast(self._tr("files.serviceNotReady"))
+            return False
+        url = (url or "").strip()
+        if not url or self._import_running:
+            return False
+        self._import_running = True
+        self._emit("files", "importRunning", True)
+        threading.Thread(target=self._import_url_run, args=(url,),
+                         daemon=True).start()
+        return True
+
+    def _import_url_run(self, url: str):
+        try:
+            from services.web_fetcher import import_from_url
+
+            def _cb(pct, msg):
+                self._emit("files", "importProgress",
+                           {"percent": pct, "msg": f"{msg}: {url}"})
+                stage = self._import_stage_from_msg(msg)
+                if stage:
+                    self._emit("files", "documentsChanged", self.files_list())
+
+            self._emit("files", "importProgress",
+                       {"percent": 0, "msg": f"抓取网页: {url}"})
+            import_from_url(url, self.file_service, progress_cb=_cb)
+            self._status(self._tr("files.urlImported"))
+        except Exception as e:
+            logger.error(f"网页导入失败 {url}: {e}", exc_info=True)
+            self._toast(f"{url}: {e}", is_error=True)
+            self._status(self._tr("status.failed"))
+        finally:
+            self._import_running = False
+            self._emit("files", "importRunning", False)
+            self._emit("files", "importProgress", {"percent": 100, "msg": ""})
+            self._emit("files", "documentsChanged", self.files_list())
+            self._emit("files", "importDone", 1)
 
     def files_delete(self, doc_id):
         # doc_id 为雪花算法 64 位整数，前端以字符串回传避免 JS 精度丢失
